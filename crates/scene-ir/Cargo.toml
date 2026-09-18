@@ -1,0 +1,9 @@
+[package]
+name = "scene-ir"
+description = "Canonical scene IR: versioned types, spans, diagnostics, symbolic anchors"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true

@@ -1,0 +1,11 @@
+<scene canvas="1080x1920" fps="30">
+  <script track="voice">
+    <line id="hook">Hello.</line>
+  </script>
+  <track id="voice" kind="audio">
+    <sound src="n.wav" during="hook..missing"/>
+  </track>
+  <track kind="visual" anchor="voice">
+    <florp/>
+  </track>
+</scene>

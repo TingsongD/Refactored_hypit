@@ -1,0 +1,25 @@
+<scene canvas="1080x1920" fps="30" clear="#0e0e12">
+  <script track="voice" voice="narrator">
+    <line id="hook">Nobody talks about the third rule of compounding.</line>
+    <line id="beat">The first rule is starting. The second is not stopping.</line>
+    <line id="payoff">The third is refusing to check the scoreboard daily.</line>
+  </script>
+
+  <track id="voice" kind="audio">
+    <sound src="assets/narration.wav" during="hook..payoff"/>
+  </track>
+
+  <track kind="visual" anchor="voice">
+    <clip src="assets/host-01.mp4" during="hook..beat"/>
+    <board during="payoff" at="center" anim="rise">
+      <text bind="payoff.text"/>
+    </board>
+    <captions style="karaoke" anchor="voice.words"/>
+  </track>
+
+  <track kind="audio">
+    <music src="assets/bed.mp3" gain="-14dB" duck="voice" during="hook..payoff"/>
+  </track>
+
+  <render target="out/final.mp4"/>
+</scene>

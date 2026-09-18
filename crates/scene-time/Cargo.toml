@@ -1,0 +1,13 @@
+[package]
+name = "scene-time"
+description = "Anchor resolution: symbolic timing + aligned audio → frame domain"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+scene-ir.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+scene-markup.workspace = true

@@ -1,0 +1,9 @@
+/target
+.DS_Store
+
+# Reference clone of the upstream project; not part of this workspace.
+/hypit/
+
+# Project-level outputs inside example/user scenes.
+out/
+cache/

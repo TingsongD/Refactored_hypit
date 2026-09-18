@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+scene-ir = { path = "crates/scene-ir" }
+scene-markup = { path = "crates/scene-markup" }
+scene-time = { path = "crates/scene-time" }
+scene-media = { path = "crates/scene-media" }
+scene-layout = { path = "crates/scene-layout" }
+scene-render = { path = "crates/scene-render" }
+scene-audio = { path = "crates/scene-audio" }
+scene-align = { path = "crates/scene-align" }
+scene-cap = { path = "crates/scene-cap" }
+scene-adapt = { path = "crates/scene-adapt" }
+scene-script = { path = "crates/scene-script" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+miette = { version = "7", features = ["fancy"] }
+
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

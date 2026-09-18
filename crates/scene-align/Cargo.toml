@@ -1,0 +1,15 @@
+[package]
+name = "scene-align"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+scene-ir = { workspace = true }
+scene-time = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+scene-markup = { workspace = true }
