@@ -209,6 +209,124 @@ mod tests {
     }
 
     #[test]
+    fn window_rebases_a_partial_mix() {
+        // Program 0..6s; a tone plays 1s..4s. A `--frames` window of
+        // 2s..3s must hear the *middle* of that tone — the source read
+        // shifts by the cut front, the delay rebases to the window.
+        let graph = AudioGraph {
+            clips: vec![
+                AudioClip {
+                    src: PathBuf::from("/p/early.wav"),
+                    target: SampleRange {
+                        start: 0,
+                        end: PROGRAM_RATE / 2,
+                    },
+                    src_start_s: 0.0,
+                    gain_db: 0.0,
+                    fade: Fade::default(),
+                    track_id: "t".into(),
+                    span: Span::new(0, 0),
+                },
+                AudioClip {
+                    src: PathBuf::from("/p/tone.wav"),
+                    target: SampleRange {
+                        start: PROGRAM_RATE,
+                        end: 4 * PROGRAM_RATE,
+                    },
+                    src_start_s: 0.0,
+                    gain_db: 0.0,
+                    fade: Fade::default(),
+                    track_id: "t".into(),
+                    span: Span::new(0, 0),
+                },
+            ],
+            duck: Vec::new(),
+            program_samples: 6 * PROGRAM_RATE,
+        };
+        let w = graph.window(2 * PROGRAM_RATE, 3 * PROGRAM_RATE);
+        // The fully-before clip drops; the tone survives rebased.
+        assert_eq!(w.clips.len(), 1);
+        let tone = &w.clips[0];
+        assert_eq!(tone.target.start, 0);
+        assert_eq!(tone.target.end, PROGRAM_RATE);
+        assert!(
+            (tone.src_start_s - 1.0).abs() < 1e-9,
+            "front cut → +1s source read"
+        );
+        assert_eq!(w.program_samples, PROGRAM_RATE);
+        let fc = filter_complex(&w);
+        assert!(fc.contains("atrim=start=1.000000:end=2.000000"), "{fc}");
+        assert!(fc.contains("adelay=0|0"), "{fc}");
+        // Identity window keeps everything; empty window yields silence.
+        let full = graph.window(0, 6 * PROGRAM_RATE);
+        assert_eq!(full.clips.len(), 2);
+        assert!(
+            graph
+                .window(4 * PROGRAM_RATE, 2 * PROGRAM_RATE)
+                .clips
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn window_remaps_duck_links() {
+        let graph = AudioGraph {
+            clips: vec![
+                AudioClip {
+                    src: PathBuf::from("/p/bed.mp3"),
+                    target: SampleRange {
+                        start: 0,
+                        end: 6 * PROGRAM_RATE,
+                    },
+                    src_start_s: 0.0,
+                    gain_db: 0.0,
+                    fade: Fade::default(),
+                    track_id: "music".into(),
+                    span: Span::new(0, 0),
+                },
+                AudioClip {
+                    src: PathBuf::from("/p/drop.wav"),
+                    target: SampleRange {
+                        start: 0,
+                        end: PROGRAM_RATE / 2,
+                    },
+                    src_start_s: 0.0,
+                    gain_db: 0.0,
+                    fade: Fade::default(),
+                    track_id: "voice".into(),
+                    span: Span::new(0, 0),
+                },
+                AudioClip {
+                    src: PathBuf::from("/p/vo.wav"),
+                    target: SampleRange {
+                        start: PROGRAM_RATE,
+                        end: 3 * PROGRAM_RATE,
+                    },
+                    src_start_s: 0.0,
+                    gain_db: 0.0,
+                    fade: Fade::default(),
+                    track_id: "voice".into(),
+                    span: Span::new(0, 0),
+                },
+            ],
+            duck: vec![DuckLink {
+                clip: 0,
+                key: vec![1, 2],
+            }],
+            program_samples: 6 * PROGRAM_RATE,
+        };
+        // Window 2s..4s: clip 1 drops out, key remaps to the survivor.
+        let w = graph.window(2 * PROGRAM_RATE, 4 * PROGRAM_RATE);
+        assert_eq!(w.duck.len(), 1);
+        assert_eq!(w.duck[0].clip, 0);
+        assert_eq!(
+            w.duck[0].key,
+            vec![1],
+            "dropped key is removed, kept key remapped"
+        );
+    }
+
+    #[test]
     fn duck_emits_sidechain_with_split_key() {
         let graph = AudioGraph {
             clips: vec![

@@ -413,12 +413,18 @@ pub fn render_inner(
 
     // Program audio: collect music/sound → 48kHz mix → muxed into the
     // same ffmpeg process as the video pipe. No audio elements = silent.
+    // `--frames` selects a window of the program timeline — the mix must
+    // be rebased onto it or a partial render plays the opening audio
+    // under later frames.
     let (graph, audio_diags) = AudioGraph::from_scene(&resolved, &project_root);
     bundles.push(DiagBundle {
         name,
         source,
         diags: audio_diags,
     });
+    let fps = resolved.frame_rate.to_f64();
+    let sample_of = |frame: u32| (frame as f64 / fps * 48_000.0 + 1e-6).floor().max(0.0) as u64;
+    let graph = graph.window(sample_of(range.start), sample_of(range.end));
     let program_wav = if graph.clips.is_empty() {
         None
     } else {
@@ -647,19 +653,59 @@ pub fn doctor() -> i32 {
     0
 }
 
-/// The src written into the draft scene: already-relative paths stay
-/// (the draft resolves assets against the scene's own directory);
-/// absolute paths shrink to relative when they sit under the cwd.
-fn adapt_src(path: &Path) -> String {
-    if path.is_relative() {
-        return path.to_string_lossy().into_owned();
+/// `path` split into components with `.`/`..` collapsed lexically —
+/// made absolute first so the result is canonical without touching the
+/// filesystem (a `..` over a symlink boundary stays the caller's
+/// problem, same as any lexical resolver).
+fn normalized_components(path: &Path) -> Vec<std::ffi::OsString> {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    // Leading RootDir/Prefix components — a `..` must never pop the anchor.
+    let mut anchored = 0usize;
+    for c in abs.components() {
+        match c {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                out.push(c.as_os_str().to_os_string());
+                anchored = out.len();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if out.len() > anchored && out.last().is_some_and(|p| p != "..") {
+                    out.pop();
+                } else {
+                    out.push(c.as_os_str().to_os_string());
+                }
+            }
+            std::path::Component::Normal(name) => out.push(name.to_os_string()),
+        }
     }
-    std::env::current_dir()
+    out
+}
+
+/// The src written into the draft scene, expressed against the directory
+/// the scene will live in — the draft resolves assets against its own
+/// path, so `--out nested/draft.scene` must not inherit cwd-relative
+/// paths. Both endpoints inside the cwd → a (possibly `..`-climbing)
+/// relative path, portable with the project tree; anything outside →
+/// the absolute path, which resolves from anywhere.
+fn adapt_src(path: &Path, scene_dir: &Path) -> String {
+    let a = normalized_components(scene_dir);
+    let b = normalized_components(path);
+    let inside = std::env::current_dir()
         .ok()
-        .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+        .map(|cwd| normalized_components(&cwd))
+        .is_some_and(|cwd| a.starts_with(&cwd) && b.starts_with(&cwd));
+    if inside {
+        let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let mut rel = PathBuf::new();
+        for _ in common..a.len() {
+            rel.push("..");
+        }
+        rel.extend(b[common..].iter().map(|c| c.as_os_str()));
+        rel.to_string_lossy().into_owned()
+    } else {
+        b.iter().collect::<PathBuf>().to_string_lossy().into_owned()
+    }
 }
 
 /// `engine adapt <source>` — ingest, analyze, emit a draft .scene.
@@ -678,7 +724,13 @@ pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
             return 1;
         }
     };
-    let src = adapt_src(&ingested.path);
+    // The draft resolves assets against its own directory — express the
+    // source against wherever the scene will actually be written.
+    let scene_dir = out
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let src = adapt_src(&ingested.path, scene_dir);
     let markup = scene_adapt::emit_scene(&src, &analysis);
 
     eprintln!(
@@ -738,17 +790,33 @@ mod tests {
     }
 
     #[test]
-    fn adapt_src_prefers_relative() {
-        // Relative paths pass through unchanged.
-        assert_eq!(adapt_src(Path::new("assets/v.mp4")), "assets/v.mp4");
-        // Absolute paths under the cwd shrink to relative.
-        let under = std::env::current_dir()
-            .unwrap()
-            .join("assets")
-            .join("v.mp4");
-        assert_eq!(adapt_src(&under), "assets/v.mp4");
-        // Outside the cwd stays absolute.
+    fn adapt_src_resolves_against_the_scene_dir() {
+        let cwd = std::env::current_dir().unwrap();
+        // Same-dir case: source beside the scene stays a bare name.
+        assert_eq!(
+            adapt_src(Path::new("assets/v.mp4"), Path::new("assets")),
+            "v.mp4"
+        );
+        // A nested --out climbs back: `adapt source.mp4 --out
+        // nested/draft.scene` must emit `../source.mp4`, not a path that
+        // only resolves from the cwd.
+        assert_eq!(
+            adapt_src(Path::new("source.mp4"), Path::new("nested")),
+            "../source.mp4"
+        );
+        // Sibling trees climb then descend.
+        assert_eq!(
+            adapt_src(Path::new("assets/v.mp4"), Path::new("nested/deep")),
+            "../../assets/v.mp4"
+        );
+        // Outside the project tree → absolute, which resolves anywhere.
         let outside = Path::new("/definitely/not/here.mp4");
-        assert_eq!(adapt_src(outside), "/definitely/not/here.mp4");
+        assert_eq!(
+            adapt_src(outside, Path::new(".")),
+            "/definitely/not/here.mp4"
+        );
+        // Absolute source inside the project still relativizes.
+        let under = cwd.join("assets").join("v.mp4");
+        assert_eq!(adapt_src(&under, Path::new(".")), "assets/v.mp4");
     }
 }

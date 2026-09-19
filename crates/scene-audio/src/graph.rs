@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use scene_ir::{Diagnostic, ElementKind, Span};
 use scene_time::{ResolvedElement, ResolvedScene, SampleRange};
 
+/// 48 kHz program rate, float form — window math shifts source read
+/// points by sample deltas over this.
+const PROGRAM_RATE_F64: f64 = 48_000.0;
+
 /// Sidechain compressor constants for `duck` — fixed for v1 so the
 /// audible behavior is a property of the engine, not per-scene tuning.
 pub const DUCK_THRESHOLD: f64 = 0.02;
@@ -90,6 +94,52 @@ impl AudioGraph {
             },
             diags,
         )
+    }
+
+    /// Rebase the mix onto `[start, end)` program samples — the window a
+    /// `--frames` partial render actually covers. Clips are clipped to
+    /// the window: the source read point shifts by however much of the
+    /// front was cut, delays rebase to the window start, and
+    /// non-overlapping clips (and duck links that lose their keys) drop
+    /// out. Without this a partial render would play the opening audio
+    /// under later frames.
+    pub fn window(&self, start: u64, end: u64) -> AudioGraph {
+        let end = end.min(self.program_samples);
+        if end <= start {
+            return AudioGraph::default();
+        }
+        let mut remap = vec![None; self.clips.len()];
+        let mut clips = Vec::with_capacity(self.clips.len());
+        for (i, clip) in self.clips.iter().enumerate() {
+            let s = clip.target.start.max(start);
+            let e = clip.target.end.min(end);
+            if e <= s {
+                continue;
+            }
+            remap[i] = Some(clips.len());
+            clips.push(AudioClip {
+                src_start_s: clip.src_start_s + (s - clip.target.start) as f64 / PROGRAM_RATE_F64,
+                target: SampleRange {
+                    start: s - start,
+                    end: e - start,
+                },
+                ..clip.clone()
+            });
+        }
+        let duck = self
+            .duck
+            .iter()
+            .filter_map(|link| {
+                let clip = remap[link.clip]?;
+                let key: Vec<usize> = link.key.iter().filter_map(|&k| remap[k]).collect();
+                (!key.is_empty()).then_some(DuckLink { clip, key })
+            })
+            .collect();
+        AudioGraph {
+            clips,
+            duck,
+            program_samples: end - start,
+        }
     }
 }
 

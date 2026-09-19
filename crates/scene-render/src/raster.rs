@@ -71,6 +71,47 @@ impl<'a> Renderer<'a> {
         pixmap.take()
     }
 
+    /// Replay program `ops()` calls for `frames` in order, without
+    /// rasterizing — rebuilds the script-side state a continuous run
+    /// would carry into the next frame. Pool workers call this over
+    /// their shard's prefix so a stateful program sees the same call
+    /// sequence at any worker count. Costs layout only (no pixels).
+    pub fn warm_programs(&mut self, frames: std::ops::Range<u32>) {
+        for frame in frames {
+            let draw_list = layout_frame(self.scene, frame, self.measure.as_mut());
+            for placed in &draw_list {
+                self.warm_placed(placed);
+            }
+        }
+    }
+
+    /// Mirror of `draw_placed`'s ordering for programs only: the same
+    /// early-return gates apply (an element that wouldn't draw never
+    /// gets its `ops()` call) and children only recurse under `Board`,
+    /// matching `draw_content`.
+    fn warm_placed(&mut self, placed: &PlacedElement) {
+        if placed.rect.w <= 0.0 || placed.rect.h <= 0.0 || placed.opacity <= 0.0 {
+            return;
+        }
+        match &placed.element.kind {
+            ElementKind::Program { src, with } => {
+                let _ = self.programs.ops(
+                    src,
+                    placed.local_frame,
+                    with.as_deref().unwrap_or("{}"),
+                    placed.rect.w,
+                    placed.rect.h,
+                );
+            }
+            ElementKind::Board => {
+                for child in &placed.children {
+                    self.warm_placed(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Draw one placed element into `dst`. `placed.rect` is relative to
     /// `origin` — children carry board-local rects, roots carry
     /// canvas-space ones.

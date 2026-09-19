@@ -9,9 +9,21 @@ use std::ops::Range;
 use std::sync::mpsc;
 use std::thread;
 
-use scene_time::{ResolvedScene, TimingMap};
+use scene_ir::ElementKind;
+use scene_time::{ResolvedElement, ResolvedScene, TimingMap};
 
 use crate::raster::Renderer;
+
+/// Any `Program` element anywhere in the scene — the warm-up pass below
+/// is skipped entirely for program-free scenes.
+fn scene_has_programs(scene: &ResolvedScene) -> bool {
+    fn any(elements: &[ResolvedElement]) -> bool {
+        elements
+            .iter()
+            .any(|e| matches!(e.kind, ElementKind::Program { .. }) || any(&e.children))
+    }
+    scene.tracks.iter().any(|t| any(&t.elements))
+}
 
 /// One rendered frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +61,12 @@ pub fn render_frames<'a>(
     // Contiguous shards, first workers get the remainder one each.
     let base = total / workers;
     let extra = total % workers;
+    let range_start = frames.start;
+    // Script state is sequential: a program's `render()` may accumulate
+    // across frames, so a worker that starts mid-range must first replay
+    // the calls a continuous run would have made — otherwise output
+    // changes with the worker count.
+    let has_programs = scene_has_programs(scene);
     let (tx, rx) = mpsc::channel::<Result<Vec<RenderedFrame>, String>>();
 
     thread::scope(|scope| {
@@ -63,6 +81,9 @@ pub fn render_frames<'a>(
                 // dropped during unwind; nothing escapes but the Err.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut renderer = make_renderer(scene, timings);
+                    if has_programs {
+                        renderer.warm_programs(range_start..shard.start);
+                    }
                     let mut out = Vec::with_capacity(len);
                     for index in shard {
                         out.push(RenderedFrame {
@@ -357,6 +378,61 @@ mod tests {
         // Frame 1's rect is taller — the op saw local_frame=1.
         assert_eq!(px(&out[1], 15, 20), (255, 0, 0));
         assert_ne!(px(&out[0], 15, 20), (255, 0, 0));
+    }
+
+    /// A *stateful* program: the drawn rect's width equals the number of
+    /// `ops()` calls this worker has made — the fingerprint of script
+    /// state accumulation. Without the shard-prefix warm-up, a worker
+    /// starting mid-range would see a fresh counter and produce
+    /// different pixels than a single-worker run.
+    struct CountingPrograms {
+        calls: u32,
+    }
+    impl scene_script::ProgramSource for CountingPrograms {
+        fn ops(
+            &mut self,
+            _src: &str,
+            _local_frame: u32,
+            _with: &str,
+            _w: f64,
+            _h: f64,
+        ) -> Option<scene_script::DrawList> {
+            self.calls += 1;
+            let (list, _) = scene_script::DrawList::from_json(&format!(
+                r##"[{{"op":"rect","x":0,"y":0,"w":{},"h":10,"c":"#ff0000"}}]"##,
+                self.calls
+            ));
+            Some(list)
+        }
+    }
+
+    #[test]
+    fn stateful_programs_are_worker_count_invariant() {
+        let mut scene = test_scene();
+        scene.tracks[0].elements.push(ResolvedElement {
+            id: None,
+            kind: ElementKind::Program {
+                src: "counter.js".into(),
+                with: None,
+            },
+            timing: timing(0, 90),
+            placement: None,
+            anim: None,
+            children: Vec::new(),
+            span: Span::new(0, 0),
+        });
+        let timings = TimingMap::default();
+        fn counting<'a>(scene: &'a ResolvedScene, timings: &'a TimingMap) -> Renderer<'a> {
+            let mut r = renderer(scene, timings);
+            r.programs = Box::new(CountingPrograms { calls: 0 });
+            r
+        }
+        let one = render_frames(&scene, &timings, 0..40, 1, &counting).unwrap();
+        let four = render_frames(&scene, &timings, 0..40, 4, &counting).unwrap();
+        assert_eq!(
+            one, four,
+            "stateful program output must not depend on worker count"
+        );
     }
 
     /// A renderer that explodes on frame 5 — the pool must report it as

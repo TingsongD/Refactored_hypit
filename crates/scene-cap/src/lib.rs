@@ -118,26 +118,19 @@ command = ["cat"]
     fn http_args_build_curl_post() {
         let args = http_args(
             "https://api.x/v1",
-            Some(&AuthRef::Keychain {
-                service: "s".into(),
-                account: "a".into(),
-            }),
-            Some("tok123"),
+            Some(&PathBuf::from("/tmp/x.curlrc")),
             &PathBuf::from("/o.png"),
         );
         assert_eq!(args[0], "curl");
         assert!(args.windows(2).any(|w| w == ["-X", "POST"]));
-        assert!(args.iter().any(|a| a == "authorization: Bearer tok123"));
+        // The bearer goes through `-K <file>` — never a literal argv header.
+        assert!(args.windows(2).any(|w| w == ["-K", "/tmp/x.curlrc"]));
+        assert!(!args.iter().any(|a| a.contains("authorization")));
         assert!(args.windows(2).any(|w| w == ["-o", "/o.png"]));
         assert_eq!(args.last().map(String::as_str), Some("https://api.x/v1"));
-        // env creds must not leak a *variable name* into a header
-        let args2 = http_args(
-            "https://api.x/v1",
-            Some(&AuthRef::Env("V".into())),
-            Some("ignored"),
-            &PathBuf::from("/o.png"),
-        );
-        assert!(!args2.iter().any(|a| a.contains("authorization")));
+        // No resolved secret → no config file reference.
+        let args2 = http_args("https://api.x/v1", None, &PathBuf::from("/o.png"));
+        assert!(!args2.iter().any(|a| a == "-K"));
     }
 
     /// A connector test double: captures the request JSON next to the

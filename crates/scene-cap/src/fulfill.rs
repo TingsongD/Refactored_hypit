@@ -73,7 +73,22 @@ pub fn fulfill(reg: &Registry, req: &CapRequest) -> Result<PathBuf, CapError> {
     match &cap.connector {
         Connector::Subprocess { argv } => run_process(cap, argv, &doc, secret.as_deref(), req.out),
         Connector::Http { endpoint } => {
-            let argv = http_args(endpoint, cap.auth.as_ref(), secret.as_deref(), req.out);
+            // The bearer header travels in a `-K` config file — argv is
+            // visible in `ps`, so a literal `authorization:` argument
+            // would leak the credential to any local process inspector.
+            let _guard;
+            let config = match secret.as_deref() {
+                Some(s) => {
+                    let path = req
+                        .out
+                        .with_extension(format!("{}.curlrc", std::process::id()));
+                    write_secret_file(&path, &curl_config(s))?;
+                    _guard = CurlRc(path.clone());
+                    Some(path)
+                }
+                None => None,
+            };
+            let argv = http_args(endpoint, config.as_deref(), req.out);
             run_process(cap, &argv, &doc, None, req.out)
         }
     }
@@ -81,13 +96,9 @@ pub fn fulfill(reg: &Registry, req: &CapRequest) -> Result<PathBuf, CapError> {
 
 /// curl argv for the HTTP connector — pure construction, testable.
 /// Response body goes straight to `out`; `-f` turns non-2xx into a
-/// failure we can read from stderr.
-pub fn http_args(
-    endpoint: &str,
-    auth: Option<&AuthRef>,
-    secret: Option<&str>,
-    out: &Path,
-) -> Vec<String> {
+/// failure we can read from stderr. `config` is the `-K` file carrying
+/// the auth header — its *path* is safe for argv; its contents are not.
+pub fn http_args(endpoint: &str, config: Option<&Path>, out: &Path) -> Vec<String> {
     let mut args = vec![
         "curl".to_string(),
         "-sfS".into(),
@@ -96,11 +107,9 @@ pub fn http_args(
         "-H".into(),
         "content-type: application/json".into(),
     ];
-    // Only *keychain-resolved* secrets travel in headers; env-var creds
-    // would put the variable name in the header, not a secret.
-    if let (Some(AuthRef::Keychain { .. }), Some(s)) = (auth, secret) {
-        args.push("-H".into());
-        args.push(format!("authorization: Bearer {s}"));
+    if let Some(cfg) = config {
+        args.push("-K".into());
+        args.push(cfg.display().to_string());
     }
     for a in [
         "--data-binary",
@@ -112,6 +121,35 @@ pub fn http_args(
         args.push(a.to_string());
     }
     args
+}
+
+/// The `-K` config body carrying the bearer header. Quotes/backslashes
+/// are escaped so an unusual secret can't break the config line.
+pub fn curl_config(secret: &str) -> String {
+    let s = secret.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("header = \"authorization: Bearer {s}\"\n")
+}
+
+/// Write a file that must never be world-readable — `create_new` refuses
+/// to follow a planted symlink, 0600 on unix.
+fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents.as_bytes())
+}
+
+/// Removes the curl config when the request ends — the bearer must not
+/// linger on disk past the child process's lifetime.
+struct CurlRc(PathBuf);
+impl Drop for CurlRc {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn run_process(
@@ -160,4 +198,57 @@ fn run_process(
         });
     }
     Ok(out.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argv_never_carries_the_secret() {
+        let cfg = Path::new("/tmp/x.curlrc");
+        let args = http_args(
+            "https://api.example/tts",
+            Some(cfg),
+            Path::new("/tmp/o.bin"),
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("s3cr3t")),
+            "no argv element may contain a credential"
+        );
+        let k = args.iter().position(|a| a == "-K").expect("config flag");
+        assert_eq!(args[k + 1], "/tmp/x.curlrc");
+    }
+
+    #[test]
+    fn no_auth_means_no_config() {
+        let args = http_args("https://api.example/tts", None, Path::new("/tmp/o.bin"));
+        assert!(!args.iter().any(|a| a == "-K"));
+    }
+
+    #[test]
+    fn config_holds_the_header() {
+        let c = curl_config("tok-123");
+        assert_eq!(c, "header = \"authorization: Bearer tok-123\"\n");
+        // Escaping keeps a quote-bearing secret inside the line.
+        let c = curl_config("a\"b");
+        assert!(c.contains("a\\\"b"));
+    }
+
+    #[test]
+    fn secret_file_is_private() {
+        let path = std::env::temp_dir().join(format!("curlrc-{}", std::process::id()));
+        write_secret_file(&path, "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // create_new refuses a clobber — a planted file isn't followed.
+        assert!(write_secret_file(&path, "y").is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
 }

@@ -51,50 +51,66 @@ impl SeqFrameSource {
         }
     }
 
-    /// Open (lazily) the stream for `src`. `frame`/`program_fps` matter
-    /// only on first open: a first request deep into the stream opens
-    /// with `-ss` instead of decoding the whole prefix — each pool
-    /// worker otherwise re-decodes frames 0..shard_start for every clip.
-    fn open(&mut self, src: &str, frame: u64, program_fps: f64) -> Option<&mut SeqStream> {
-        if !self.streams.contains_key(src) {
-            let path = self.root.join(src);
-            let info = probe(&path).ok()?;
-            let source_fps = info
-                .video
-                .as_ref()
-                .and_then(|v| v.frame_rate)
-                .map(|r| r.to_f64())
-                .unwrap_or(30.0);
-            let target = ((frame as f64) * source_fps / program_fps).floor() as u64;
-            // Seek to half a frame before the target: ffmpeg's accurate
-            // seek then delivers `target` as the first decoded frame
-            // (exact on CFR sources; ±1 on VFR). Decoded indices restart
-            // at 0, so `base` carries the source offset.
-            let (base, stream) = if target >= SEEK_THRESHOLD {
-                let secs = format!("{:.6}", (target as f64 - 0.5) / source_fps);
-                (
-                    target,
-                    FrameStream::open_with(&path, &info, &["-ss", &secs]),
-                )
-            } else {
-                (0, FrameStream::open_with(&path, &info, &[]))
-            };
-            let opened = stream.ok().map(|stream| SeqStream {
-                stream,
-                ratio: source_fps,
-                base,
-                current: None,
-            });
-            self.streams.insert(src.to_string(), opened);
+    /// Decode `path` starting near `frame` (a program frame): a deep
+    /// first target opens with `-ss` instead of decoding the whole
+    /// prefix — each pool worker otherwise re-decodes frames
+    /// 0..shard_start for every clip. Returns the stream plus enough
+    /// bookkeeping to translate pipe-relative indices back to source
+    /// frames.
+    fn spawn(path: &Path, frame: u64, program_fps: f64) -> Option<SeqStream> {
+        let info = probe(path).ok()?;
+        let source_fps = info
+            .video
+            .as_ref()
+            .and_then(|v| v.frame_rate)
+            .map(|r| r.to_f64())
+            .unwrap_or(30.0);
+        let target = ((frame as f64) * source_fps / program_fps).floor() as u64;
+        // Seek to half a frame before the target: ffmpeg's accurate
+        // seek then delivers `target` as the first decoded frame
+        // (exact on CFR sources; ±1 on VFR). Decoded indices restart
+        // at 0, so `base` carries the source offset.
+        let (base, stream) = if target >= SEEK_THRESHOLD {
+            let secs = format!("{:.6}", (target as f64 - 0.5) / source_fps);
+            (target, FrameStream::open_with(path, &info, &["-ss", &secs]))
+        } else {
+            (0, FrameStream::open_with(path, &info, &[]))
+        };
+        stream.ok().map(|stream| SeqStream {
+            stream,
+            ratio: source_fps,
+            base,
+            current: None,
+        })
+    }
+
+    /// Open (lazily) the stream for `src`. Free-standing over the two
+    /// fields so `sample` can hold the map borrow while respawning.
+    fn open<'a>(
+        streams: &'a mut HashMap<String, Option<SeqStream>>,
+        root: &Path,
+        src: &str,
+        frame: u64,
+        program_fps: f64,
+    ) -> Option<&'a mut SeqStream> {
+        if !streams.contains_key(src) {
+            let opened = Self::spawn(&root.join(src), frame, program_fps);
+            streams.insert(src.to_string(), opened);
         }
-        self.streams.get_mut(src)?.as_mut()
+        streams.get_mut(src)?.as_mut()
     }
 }
 
 impl FrameSource for SeqFrameSource {
     fn sample(&mut self, src: &str, frame: u64, fps: f64) -> Option<Frame> {
-        let seq = self.open(src, frame, fps)?;
+        let seq = Self::open(&mut self.streams, &self.root, src, frame, fps)?;
         let target = ((frame as f64) * seq.ratio / fps).floor() as u64;
+        // A backward target means a later element restarted the source —
+        // the pipe can't rewind, so serving `current` would freeze the
+        // clip on the previous element's last frame. Reopen instead.
+        if seq.current.as_ref().is_some_and(|f| f.index > target) {
+            *seq = Self::spawn(&self.root.join(src), frame, fps)?;
+        }
         // Advance the decode until the current frame covers `target`.
         loop {
             match &seq.current {

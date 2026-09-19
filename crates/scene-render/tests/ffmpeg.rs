@@ -88,6 +88,37 @@ fn seeked_sample_matches_unseeked_decode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two elements sharing one source: the second restarts at frame 0.
+/// Without a reopen, `sample` would keep serving the first element's
+/// last decoded frame — the clip appears frozen on its tail.
+#[test]
+fn reusing_a_source_restarts_the_clip() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tempdir("restart");
+    let clip = make_clip(&dir);
+    let root = clip.parent().unwrap().to_path_buf();
+    let name = clip.file_name().unwrap().to_str().unwrap().to_string();
+
+    let mut source = SeqFrameSource::new(root);
+    // First element plays deep into the clip.
+    let _ = source.sample(&name, 100, 30.0).expect("deep sample");
+    // Second element restarts at its own frame 0 → source frame 0.
+    let restarted = source.sample(&name, 0, 30.0).expect("restarted frame");
+    assert_eq!(restarted.index, 0);
+    let reference = FrameStream::open(&clip)
+        .unwrap()
+        .next()
+        .expect("has frame 0")
+        .unwrap();
+    assert_eq!(
+        restarted.pixels, reference.pixels,
+        "restarted clip must show frame 0, not the previous tail"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Below the threshold the stream opens from 0 — no seek, index equals
 /// the plain decoded position.
 #[test]
