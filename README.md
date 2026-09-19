@@ -4,11 +4,12 @@ Agent-authored video, timed by words. Write a `.scene` document — script,
 tracks, anchored elements — and the `engine` binary compiles it into an
 mp4. Rewrite a line and the composition re-times itself.
 
-Status: **all 11 modules complete** — markup → IR → timing → layout →
+Status: **all 12 modules complete** — markup → IR → timing → layout →
 raster → audio → mux, plus alignment, capabilities, sandboxed `<program>`
-scripts, and `adapt` ingestion. See `DESIGN.md` for architecture and the
-per-module gates; `SKILL.md` for the authoring reference;
-`docs/playbooks/` for worked examples.
+scripts, `adapt` ingestion, and the localhost test UI. See `DESIGN.md`
+for architecture and the per-module gates; `SKILL.md` for the authoring
+reference; `docs/playbooks/` for worked examples; `DEV_LOG.md` for the
+change history.
 
 ## Install
 
@@ -71,6 +72,7 @@ crates/
   scene-media    ffprobe/ffmpeg subprocesses: probe, decode, encode
   scene-layout   resolved elements → positioned boxes per frame
   scene-render   tiny-skia raster + cosmic-text + deterministic worker pool
+                 (frames stream to the encoder over bounded per-shard queues)
   scene-audio    48 kHz clip graph → ffmpeg filtergraph mix (ducking)
   scene-align    markers-file / WhisperX → TimingMap
   scene-cap      capability registry: credentials + subprocess/HTTP connectors

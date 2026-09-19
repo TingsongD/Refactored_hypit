@@ -108,7 +108,16 @@ pub fn filter_complex(graph: &AudioGraph) -> String {
         out.push(';');
     }
     let inputs: String = mix_label.iter().map(|l| format!("[{l}]")).collect();
-    out += &format!("{inputs}amix=inputs={}:normalize=0[aout]", mix_label.len());
+    // amix ends at its longest chain — a 0.5s sting in a 3s program
+    // mixes 0.5s. `apad` extends with silence to the program length so
+    // the muxer's `-shortest` can't truncate the video track; `-t` in
+    // mix_args still cuts any overshoot to the program exactly.
+    let program_s = graph.program_samples as f64 / PROGRAM_RATE as f64;
+    out += &format!(
+        "{inputs}amix=inputs={}:normalize=0,apad=whole_dur={}[aout]",
+        mix_label.len(),
+        fmt(program_s)
+    );
     out
 }
 

@@ -49,9 +49,10 @@ The emitted draft:
 
 The `Shot N` placeholders are where your content goes:
 
-- Replace a `<text>Shot 2</text>` with `<text bind="line.id"/>` once
-  you've written a `<script>` and switched the literal `during`s to
-  cue anchors.
+- Replace a `<text>Shot 2</text>` with `<text bind="hook.text"/>` once
+  you've written a `<script>` (with `<line id="hook">…`) and switched
+  the literal `during`s to cue anchors. `.text` is the only bindable
+  property today.
 - Soft cuts and dissolves don't register — only hard boundaries.
   Add boards by hand where the content actually turns.
 - The music element keeps the source's own audio; mute it with
@@ -61,8 +62,8 @@ The `Shot N` placeholders are where your content goes:
 
 - `engine check main.scene` — the emitter always produces valid markup;
   if check fails, it's something *you* edited.
-- Very short clips or single-shot footage legitimately emit zero
-  boards — that's "no cuts found", not a bug.
+- Single-shot footage emits **one** board covering the whole duration —
+  the emitter always writes at least a `Shot 1` placeholder.
 - `adapt` never stores word timing; literal `Ns..Ms` anchors are what
   the draft uses. Bring in `<script>` + `align` when you want symbolic
   timing.

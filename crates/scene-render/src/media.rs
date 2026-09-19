@@ -5,10 +5,25 @@
 //! advances monotonically. Random access (scrubbing a long GOP) is the
 //! cache's problem, not the rasterizer's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use scene_media::{Frame, FrameStream, MediaError, probe};
+
+/// Shared per-render failure log. Worker-local sources record
+/// `src → reason` here; the caller drains it into diagnostics after
+/// `render_frames`. Set-dedup means a broken asset reports once, not
+/// once per frame per worker.
+pub type WarnSink = Arc<Mutex<BTreeSet<String>>>;
+
+fn warn(sink: &Option<WarnSink>, msg: String) {
+    if let Some(s) = sink
+        && let Ok(mut w) = s.lock()
+    {
+        w.insert(msg);
+    }
+}
 
 /// Pixels for one authored asset at one program instant.
 pub trait FrameSource {
@@ -25,6 +40,7 @@ pub trait FrameSource {
 pub struct SeqFrameSource {
     root: PathBuf,
     streams: HashMap<String, Option<SeqStream>>,
+    warnings: Option<WarnSink>,
 }
 
 struct SeqStream {
@@ -48,7 +64,15 @@ impl SeqFrameSource {
         SeqFrameSource {
             root,
             streams: HashMap::new(),
+            warnings: None,
         }
+    }
+
+    /// Record decode failures into `sink` so a missing/unreadable clip
+    /// reaches the diagnostic report instead of silently placeholdering.
+    pub fn with_warnings(mut self, sink: WarnSink) -> Self {
+        self.warnings = Some(sink);
+        self
     }
 
     /// Decode `path` starting near `frame` (a program frame): a deep
@@ -57,8 +81,8 @@ impl SeqFrameSource {
     /// 0..shard_start for every clip. Returns the stream plus enough
     /// bookkeeping to translate pipe-relative indices back to source
     /// frames.
-    fn spawn(path: &Path, frame: u64, program_fps: f64) -> Option<SeqStream> {
-        let info = probe(path).ok()?;
+    fn spawn(path: &Path, frame: u64, program_fps: f64) -> Result<SeqStream, String> {
+        let info = probe(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let source_fps = info
             .video
             .as_ref()
@@ -76,12 +100,14 @@ impl SeqFrameSource {
         } else {
             (0, FrameStream::open_with(path, &info, &[]))
         };
-        stream.ok().map(|stream| SeqStream {
-            stream,
-            ratio: source_fps,
-            base,
-            current: None,
-        })
+        stream
+            .map(|stream| SeqStream {
+                stream,
+                ratio: source_fps,
+                base,
+                current: None,
+            })
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// Open (lazily) the stream for `src`. Free-standing over the two
@@ -92,10 +118,18 @@ impl SeqFrameSource {
         src: &str,
         frame: u64,
         program_fps: f64,
+        warnings: &Option<WarnSink>,
     ) -> Option<&'a mut SeqStream> {
         if !streams.contains_key(src) {
-            let opened = Self::spawn(&root.join(src), frame, program_fps);
-            streams.insert(src.to_string(), opened);
+            match Self::spawn(&root.join(src), frame, program_fps) {
+                Ok(s) => {
+                    streams.insert(src.to_string(), Some(s));
+                }
+                Err(e) => {
+                    warn(warnings, format!("clip `{src}` unreadable: {e}"));
+                    streams.insert(src.to_string(), None);
+                }
+            }
         }
         streams.get_mut(src)?.as_mut()
     }
@@ -103,13 +137,26 @@ impl SeqFrameSource {
 
 impl FrameSource for SeqFrameSource {
     fn sample(&mut self, src: &str, frame: u64, fps: f64) -> Option<Frame> {
-        let seq = Self::open(&mut self.streams, &self.root, src, frame, fps)?;
+        let seq = Self::open(
+            &mut self.streams,
+            &self.root,
+            src,
+            frame,
+            fps,
+            &self.warnings,
+        )?;
         let target = ((frame as f64) * seq.ratio / fps).floor() as u64;
         // A backward target means a later element restarted the source —
         // the pipe can't rewind, so serving `current` would freeze the
         // clip on the previous element's last frame. Reopen instead.
         if seq.current.as_ref().is_some_and(|f| f.index > target) {
-            *seq = Self::spawn(&self.root.join(src), frame, fps)?;
+            match Self::spawn(&self.root.join(src), frame, fps) {
+                Ok(s) => *seq = s,
+                Err(e) => {
+                    warn(&self.warnings, format!("clip `{src}` unreadable: {e}"));
+                    return None;
+                }
+            }
         }
         // Advance the decode until the current frame covers `target`.
         loop {
@@ -161,6 +208,7 @@ pub fn decode_still(path: &Path) -> Result<Frame, MediaError> {
 pub struct StillFrameSource {
     root: PathBuf,
     cache: HashMap<String, Option<Frame>>,
+    warnings: Option<WarnSink>,
 }
 
 impl StillFrameSource {
@@ -168,16 +216,63 @@ impl StillFrameSource {
         StillFrameSource {
             root,
             cache: HashMap::new(),
+            warnings: None,
         }
+    }
+
+    /// Record decode failures into `sink` — see `SeqFrameSource`.
+    pub fn with_warnings(mut self, sink: WarnSink) -> Self {
+        self.warnings = Some(sink);
+        self
     }
 }
 
 impl FrameSource for StillFrameSource {
     fn sample(&mut self, src: &str, _frame: u64, _fps: f64) -> Option<Frame> {
         if !self.cache.contains_key(src) {
-            let frame = decode_still(&self.root.join(src)).ok();
-            self.cache.insert(src.to_string(), frame);
+            match decode_still(&self.root.join(src)) {
+                Ok(f) => {
+                    self.cache.insert(src.to_string(), Some(f));
+                }
+                Err(e) => {
+                    warn(&self.warnings, format!("image `{src}` unreadable: {e}"));
+                    self.cache.insert(src.to_string(), None);
+                }
+            }
         }
         self.cache.get(src)?.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_still_reports_into_the_sink() {
+        let sink = WarnSink::default();
+        let mut source =
+            StillFrameSource::new(PathBuf::from("/nonexistent-dir")).with_warnings(sink.clone());
+        assert!(source.sample("missing.png", 0, 0.0).is_none());
+        // Second sample hits the cache — the warning must not repeat.
+        assert!(source.sample("missing.png", 0, 0.0).is_none());
+        let w = sink.lock().unwrap();
+        assert_eq!(w.len(), 1);
+        assert!(w.iter().next().unwrap().contains("missing.png"), "{w:?}");
+    }
+
+    #[test]
+    fn missing_clip_reports_into_the_sink() {
+        let sink = WarnSink::default();
+        let mut source =
+            SeqFrameSource::new(PathBuf::from("/nonexistent-dir")).with_warnings(sink.clone());
+        assert!(source.sample("gone.mp4", 0, 30.0).is_none());
+        assert!(!sink.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_sink_is_silent_but_still_none() {
+        let mut source = StillFrameSource::new(PathBuf::from("/nonexistent-dir"));
+        assert!(source.sample("missing.png", 0, 0.0).is_none());
     }
 }

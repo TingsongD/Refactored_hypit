@@ -17,6 +17,6 @@ pub use diagnostic::{Diagnostic, Severity, has_errors};
 pub use scene::{
     AnimKind, Canvas, CaptionStyle, Color, Element, ElementKind, IR_FORMAT, NamedPlacement,
     Placement, Rational, RenderTarget, Scene, Script, ScriptLine, TextContent, Track, TrackKind,
-    parse_gain_db,
+    parse_gain_db, script_fingerprint,
 };
 pub use span::Span;

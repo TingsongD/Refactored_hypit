@@ -204,7 +204,12 @@ mod tests {
         assert!(fc.contains("aresample=48000"), "{fc}");
         assert!(fc.contains("afade=t=in:st=0:d=0.250000"), "{fc}");
         assert!(fc.contains("afade=t=out:st=2.500000:d=0.500000"), "{fc}");
-        assert!(fc.contains("amix=inputs=1:normalize=0[aout]"), "{fc}");
+        // The mix pads with silence to the program length (10s here) so
+        // `-shortest` muxing can't truncate video to the last clip's end.
+        assert!(
+            fc.contains("amix=inputs=1:normalize=0,apad=whole_dur=10.000000[aout]"),
+            "{fc}"
+        );
         assert!(!fc.contains("sidechaincompress"));
     }
 
@@ -371,7 +376,7 @@ mod tests {
         );
         // Final mix takes the ducked music + the key's mix branch.
         assert!(
-            fc.contains("[duck0][a1m]amix=inputs=2:normalize=0[aout]"),
+            fc.contains("[duck0][a1m]amix=inputs=2:normalize=0,apad=whole_dur=6.000000[aout]"),
             "{fc}"
         );
     }

@@ -67,10 +67,19 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// Response payload: small bodies stay in memory; file bodies stream in
+/// chunks so a plain GET on a large mp4 never buffers it whole.
+enum Body {
+    Bytes(Vec<u8>),
+    File { file: std::fs::File, remaining: u64 },
+}
+
 struct Response {
     status: u16,
     content_type: &'static str,
-    body: Vec<u8>,
+    /// Content-Length — known upfront for both body kinds.
+    body_len: u64,
+    body: Body,
     extra_headers: Vec<String>,
 }
 
@@ -79,7 +88,8 @@ impl Response {
         Response {
             status,
             content_type,
-            body,
+            body_len: body.len() as u64,
+            body: Body::Bytes(body),
             extra_headers: Vec::new(),
         }
     }
@@ -108,8 +118,7 @@ fn handle(mut stream: TcpStream, dir: &Path) {
     };
     let mut head = format!(
         "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        res.content_type,
-        res.body.len()
+        res.content_type, res.body_len
     );
     for h in &res.extra_headers {
         head.push_str(h);
@@ -117,8 +126,32 @@ fn handle(mut stream: TcpStream, dir: &Path) {
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes());
-    if req.method != "HEAD" {
-        let _ = stream.write_all(&res.body);
+    if req.method == "HEAD" {
+        return;
+    }
+    match res.body {
+        Body::Bytes(b) => {
+            let _ = stream.write_all(&b);
+        }
+        Body::File {
+            mut file,
+            remaining,
+        } => {
+            let mut buf = [0u8; 64 * 1024];
+            let mut left = remaining;
+            while left > 0 {
+                let want = left.min(buf.len() as u64) as usize;
+                match file.read(&mut buf[..want]) {
+                    Ok(0) | Err(_) => break, // EOF or error mid-body: close
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        left -= n as u64;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -265,19 +298,24 @@ fn serve_file(dir: &Path, path: &str, req: &Request) -> Response {
         Some((s, e)) => (206, s, e.min(total)),
         None => (200, 0, total),
     };
-    let mut body = Vec::new();
-    let served = (|| -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom};
-        let mut f = std::fs::File::open(&file)?;
-        f.seek(SeekFrom::Start(start as u64))?;
-        f.take((end - start) as u64).read_to_end(&mut body)?;
-        Ok(())
-    })()
-    .is_ok();
-    if !served {
+    // Open + seek now, stream in `handle` — a 200 on a big mp4 buffers
+    // nothing beyond the 64KB copy buffer.
+    use std::io::{Seek, SeekFrom};
+    let file = std::fs::File::open(&file)
+        .and_then(|mut f| f.seek(SeekFrom::Start(start as u64)).map(|_| f));
+    let Ok(file) = file else {
         return Response::new(404, "text/plain", b"not found".to_vec());
-    }
-    let mut res = Response::new(status, content_type(&name), body);
+    };
+    let mut res = Response {
+        status,
+        content_type: content_type(&name),
+        body_len: (end - start) as u64,
+        body: Body::File {
+            file,
+            remaining: (end - start) as u64,
+        },
+        extra_headers: Vec::new(),
+    };
     res.extra_headers.push("Accept-Ranges: bytes".to_string());
     if status == 206 {
         res.extra_headers
@@ -504,7 +542,8 @@ mod tests {
         let r = req("GET", "/out/v.mp4", &[("range", "bytes=9-2")], &[]);
         let res = serve_file(&dir, r.path.as_str(), &r);
         assert_eq!(res.status, 200); // bad range → full body, no panic
-        assert_eq!(res.body.len(), 10);
+        assert_eq!(res.body_len, 10);
+        assert!(matches!(res.body, Body::File { .. }), "file bodies stream");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -655,9 +694,9 @@ mod tests {
         let r = req("HEAD", "/out/v.mp4", &[], &[]);
         let res = route(&r, &dir);
         assert_eq!(res.status, 200);
-        // Body computed for Content-Length correctness; `handle` skips
-        // sending it for HEAD — that's the wire contract.
-        assert_eq!(res.body.len(), 10);
+        // Length known for Content-Length; `handle` skips the body for
+        // HEAD — that's the wire contract.
+        assert_eq!(res.body_len, 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

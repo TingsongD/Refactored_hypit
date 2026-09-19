@@ -145,6 +145,17 @@ impl Lower {
         let mut tracks = Vec::new();
         let mut render = None;
         self.no_text(root);
+        // `script_track` must be known before any track lowers — a
+        // `<captions>` without `anchor` defaults to it regardless of
+        // whether <script> is declared above or below the track.
+        for child in root.element_children() {
+            if child.name == "script"
+                && let Some(t) = child.attr("track")
+            {
+                self.script_track = Some(t.value.clone());
+                break;
+            }
+        }
         for (index, child) in root.element_children().enumerate() {
             match child.name.as_str() {
                 "script" => {
@@ -686,6 +697,37 @@ mod tests {
                 _ => None,
             })
             .unwrap();
+        assert_eq!(captions.source, "voice");
+        assert_eq!(captions.granularity, Granularity::Word);
+    }
+
+    #[test]
+    fn captions_default_works_when_script_comes_later() {
+        // Declaration order must not matter: <captions> with no `anchor`
+        // defaults to the script's track even when <script> sits *below*
+        // the track in the document.
+        let src = r##"<scene canvas="1080x1920" fps="30">
+  <track kind="visual">
+    <captions/>
+  </track>
+  <track id="voice" kind="audio">
+    <sound src="n.wav" during="hook"/>
+  </track>
+  <script track="voice">
+    <line id="hook">Hello.</line>
+  </script>
+</scene>"##;
+        let (scene, diags) = lower_str(src);
+        assert!(errors(&diags).is_empty(), "errors: {:?}", errors(&diags));
+        let scene = scene.unwrap();
+        let captions = scene.tracks[0]
+            .elements
+            .iter()
+            .find_map(|e| match &e.kind {
+                ElementKind::Captions { source, .. } => Some(source),
+                _ => None,
+            })
+            .expect("captions element survived lowering");
         assert_eq!(captions.source, "voice");
         assert_eq!(captions.granularity, Granularity::Word);
     }

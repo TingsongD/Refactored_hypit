@@ -16,7 +16,7 @@ from any existing project.
                       realize (M3): anchors → aligned audio → frame domain
                                         │
                               frame program ──▶ render workers (Skia, M1)
-                                        │              │ raw frames (NV12)
+                                        │              │ frames, bounded + ordered
                        audio graph (M2) ──▶ 48kHz mix ──▶ ffmpeg mux
                                         ▼
                                     out.mp4
@@ -50,7 +50,7 @@ before the previous gate is green.
 | M1 | `scene-time` | TimingSource (aligned words), anchor → frame/sample resolution, ResolvedScene, program span, untimed-element inheritance | ✅ done — 21 tests green (58 total) |
 | M2 | `scene-media` | ffprobe JSON → MediaInfo; ffmpeg rawvideo decode → frame iterator | ✅ done — 7 unit + 3 env-gated integration tests green (verified with real ffmpeg 8.0: 10 frames decoded from 1s@10fps lavfi clip) |
 | M3 | `scene-layout` | element tree + resolved timing → positioned boxes per frame; `at` placement; board child stacking | ✅ done — 19 tests green; `Measure` seam takes `(element, local_s)` |
-| M4 | `scene-render` | tiny-skia raster (clip/image/board/text/captions), entrance anims, worker pool, RGBA→NV12 (BT.709) | ✅ done — 12 tests green; byte-identical across 1/4/7 workers; real cosmic-text ink verified |
+| M4 | `scene-render` | tiny-skia raster (clip/image/board/text/captions), entrance anims, worker pool, RGBA→NV12 (BT.709) | ✅ done — 12 tests green; byte-identical across 1/4/7 workers *including stateful programs* (shard-prefix ops replay); real cosmic-text ink verified |
 | M5 | mux | NV12 pipe → ffmpeg → mp4 (silent); `engine render` end-to-end | ✅ done — 4 unit + 5 gated tests; 30f roundtrip probed 64x36@30/1; `engine render` smoke: 90f → h264/yuv420p/3.0s verified |
 | M6 | `scene-audio` | 48kHz clip graph → ffmpeg filtergraph; real sidechain ducking; `Encoder::open_muxed*` muxes AAC | ✅ done — 7 unit + 2 gated mix tests; ducking verified ≥3dB band-isolated; e2e render = h264+aac/48k stereo |
 | M7 | `scene-align` | markers-file connector (`cue t0 t1`, even word spread); WhisperX JSON parser (order-matched); `engine align` → `--timings` JSON | ✅ done — 7 tests incl. connector→realize integration; e2e align→render verified |
@@ -62,6 +62,42 @@ before the previous gate is green.
 
 Gates that need ffmpeg mark the test `#[ignore]` unless `SCENE_MEDIA_TESTS=1`
 is set — CI runs them on the legs that install ffmpeg.
+
+## Hardening invariants (post-M12 review passes)
+
+Facts a change must preserve — each is pinned by a test:
+
+- **Worker-count determinism covers state.** Before rasterizing its
+  shard, a worker replays every `ops()` call the shard's prefix frames
+  would have made (layout only, no pixels). A `render()` that
+  accumulates on `d` produces identical output at 1 or N workers.
+- **Sequential media can go backward by reopening.** A `sample` target
+  behind the decode head respawns the stream (with `-ss` when deep);
+  serving the stale current frame is the bug that motivated it.
+- **`--frames` windows rebase audio.** `AudioGraph::window` clips the
+  mix to the rendered range — source reads shift by the cut front,
+  delays rebase to the window start. A partial render hears its own
+  span, not the opening.
+- **ffmpeg pipes are drained concurrently.** stderr runs on a thread
+  into a bounded tail; a verbose child can't deadlock the pipe.
+- **Credentials never touch argv.** HTTP connector auth goes through a
+  0600 `curl -K` config file; subprocess connectors see only
+  `SCENE_CAP_AUTH` in their environment. Env and keychain refs resolve
+  identically — both produce the header.
+- **The UI serves only `out/`'s real contents.** Canonical-path
+  containment rejects symlink escapes; malformed percent-encoding and
+  inverted ranges return 4xx/200, never panic.
+- **A worker panic is an `Err`, not a dead process.**
+- **Frames stream through bounded per-shard channels.** Each worker
+  pushes rendered frames into its own `sync_channel(SHARD_QUEUE)`; the
+  caller drains shards in index order — disjoint contiguous ranges make
+  that ordered concatenation, no reorder buffer — and feeds the encoder
+  through a callback, all inside `thread::scope`. Peak frame memory is
+  `workers×(q+1)+1` frames (~340 MB at 8 workers/1080×1920) regardless
+  of duration, not the whole video. Cancellation is flag + dropped
+  receivers (a blocked `send` never observes a flag); the initiating
+  error always propagates. `render_frames` remains as a collecting
+  wrapper for tests and short clips.
 
 ## Timing semantics (locked by M1 tests)
 
@@ -83,12 +119,12 @@ is set — CI runs them on the legs that install ffmpeg.
 
 ## Element vocabulary (v1)
 
-`clip`, `image`, `text`, `board`, `captions`, `music`, `sound`; `program` is
-reserved. Common attributes: `id`, `during`, `at`, `anim`. A `program`
-escape hatch (M4) covers everything the vocabulary doesn't.
+`clip`, `image`, `text`, `board`, `captions`, `music`, `sound`, `program`
+(the M4 QuickJS escape hatch, shipped). Common attributes: `id`, `during`,
+`at`, `anim`; `program` takes `src` + optional `with` JSON.
 
 ## Non-goals for v1
 
 - Arbitrary HTML/CSS rendering — curated element set instead, with a
   browser-backed fallback only if a real component demands it.
-- A GUI — `engine serve` + external tooling first; native inspector later.
+- A GUI — `engine ui` (the localhost page) first; native inspector later.

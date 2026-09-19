@@ -96,5 +96,6 @@ pub fn whisperx_to_timing(
 pub fn timing_map_for(script: &Script, source: TimingSource) -> scene_time::TimingMap {
     let mut map = scene_time::TimingMap::default();
     map.insert(script.track.clone(), source);
+    map.script_hash = Some(scene_ir::script_fingerprint(script));
     map
 }

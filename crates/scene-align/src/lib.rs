@@ -62,6 +62,17 @@ mod tests {
     }
 
     #[test]
+    fn markers_reject_nonfinite_times() {
+        // `NaN`/`inf` parse as f64 but serialize to `null` — a timings
+        // file the render side can't read back. Reject at parse time.
+        let (markers, diags) = parse_markers("hook 0 NaN\npayoff 0 inf\nok 0.0 1.0\n");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].cue, "ok");
+        assert_eq!(diags.len(), 2);
+        assert!(diags.iter().all(|d| d.is_error()));
+    }
+
+    #[test]
     fn markers_spread_words_evenly() {
         let (markers, _) = parse_markers("hook 0.0 1.2\npayoff 1.2 2.4\n");
         let (source, diags) = markers_to_timing(&markers, &script());
@@ -167,5 +178,25 @@ mod tests {
         // word offsets clamp at the measured stream's end → stays 90.
         assert_eq!(boards[1].timing.frames.start, 64);
         assert_eq!(boards[1].timing.frames.end, 90);
+    }
+
+    #[test]
+    fn timing_map_stamps_the_script_fingerprint() {
+        // The render side detects "aligned to different words" via this
+        // hash — it must survive a serialize/deserialize round trip.
+        let s = script();
+        let (markers, _) = parse_markers("hook 0.0 1.5\npayoff 1.6 3.0\n");
+        let (source, _) = markers_to_timing(&markers, &s);
+        let map = timing_map_for(&s, source);
+        assert_eq!(
+            map.script_hash.as_deref(),
+            Some(scene_ir::script_fingerprint(&s).as_str())
+        );
+        let json = serde_json::to_string(&map).unwrap();
+        let back: scene_time::TimingMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.script_hash, map.script_hash);
+        // …and a timing doc without the field still loads (legacy).
+        let legacy: scene_time::TimingMap = serde_json::from_str(r#"{"sources":{}}"#).unwrap();
+        assert!(legacy.script_hash.is_none());
     }
 }

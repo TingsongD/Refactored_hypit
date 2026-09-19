@@ -233,4 +233,81 @@ command = ["cat"]
         .unwrap_err();
         assert!(matches!(err, CapError::Unknown(n) if n == "ghost"));
     }
+
+    #[test]
+    fn stale_out_does_not_masquerade_as_output() {
+        let dir = std::env::temp_dir().join(format!("scene-cap-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Connector exits 0 but writes nothing; `out` already holds an
+        // old asset. Success must not be claimed on the stale file.
+        let script = dir.join("noop.sh");
+        std::fs::write(&script, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = dir.join("asset.bin");
+        std::fs::write(&out, "OLD ASSET").unwrap();
+        let toml = format!(
+            "[capabilities.noop]\ncommand = [\"{}\"]\n",
+            script.display()
+        );
+        let reg = Registry::from_toml(&toml).unwrap();
+        let err = fulfill(
+            &reg,
+            &CapRequest {
+                capability: "noop",
+                params: json!({}),
+                out: &out,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CapError::NoOutput { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connector that floods stderr *before* reading the request used
+    /// to deadlock: we wrote all of stdin before draining stderr. The
+    /// channel timeout turns a regression into a test failure instead of
+    /// a hung suite.
+    #[test]
+    fn chatty_connector_does_not_deadlock() {
+        let dir = std::env::temp_dir().join(format!("scene-cap-chatty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("chatty.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\0' 'x' >&2\njson=$(cat)\nout=$(echo \"$json\" | sed -n 's/.*\"out\" *: *\"\\([^\"]*\\)\".*/\\1/p')\nprintf 'OK' > \"$out\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = dir.join("asset.bin");
+        let toml = format!(
+            "[capabilities.chatty]\ncommand = [\"{}\"]\n",
+            script.display()
+        );
+        let reg = Registry::from_toml(&toml).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = fulfill(
+                &reg,
+                &CapRequest {
+                    capability: "chatty",
+                    params: json!({"n": 1}),
+                    out: &out,
+                },
+            );
+            let _ = tx.send(r.is_ok());
+        });
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("fulfill deadlocked — stderr not drained during stdin write");
+        assert!(ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

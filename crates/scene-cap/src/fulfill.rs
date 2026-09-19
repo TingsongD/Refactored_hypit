@@ -174,21 +174,38 @@ fn run_process(
     {
         cmd.env(AUTH_ENV, v);
     }
+    // A stale file at `out` must not masquerade as this request's
+    // output — a connector that exits 0 without writing would otherwise
+    // pass the existence check below.
+    let _ = std::fs::remove_file(out);
     let mut child = cmd.spawn().map_err(|e| CapError::Spawn {
         tool: "connector",
         source: e,
     })?;
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin piped")
-        .write_all(stdin_json.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    // stderr drains on its own thread while stdin writes: a connector
+    // that logs more than a pipe buffer before reading the request
+    // would otherwise deadlock both processes.
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let drain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut buf);
+        buf
+    });
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let doc = stdin_json.to_string();
+    let writer = std::thread::spawn(move || {
+        std::io::Write::write_all(&mut stdin, doc.as_bytes()).map_err(|e| e.to_string())
+    });
+    let status = child.wait()?;
+    // A failed write means the connector closed stdin early — its exit
+    // status and stderr carry the real story; don't mask it.
+    let _ = writer.join();
+    let stderr_bytes = drain.join().unwrap_or_default();
+    if !status.success() {
         return Err(CapError::Failed {
             cap: cap.name.clone(),
-            status: output.status.to_string(),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            status: status.to_string(),
+            detail: String::from_utf8_lossy(&stderr_bytes).trim().to_string(),
         });
     }
     if !out.is_file() || std::fs::metadata(out).map(|m| m.len()).unwrap_or(0) == 0 {

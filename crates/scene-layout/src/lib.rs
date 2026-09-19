@@ -142,6 +142,99 @@ impl<'m> Placer<'m> {
         }
     }
 
+    /// Content size of a stack member. Boards size themselves from their
+    /// *own* children's stack — `Measure` only knows leaf content
+    /// (text/captions); a nested board measured through it would return
+    /// `None` and silently drop out of the layout.
+    fn stack_size(&mut self, element: &ResolvedElement, frame: u32) -> Option<Size> {
+        let range = element.timing.frames;
+        let local_s = f64::from(frame - range.start) / self.fps;
+        if matches!(element.kind, ElementKind::Board) {
+            // Children extent first; `Measure` is the empty-board fallback
+            // (a styled panel), matching `place_one`'s board arm.
+            self.board_size(element, frame)
+                .or_else(|| self.measure.measure(element, local_s))
+        } else {
+            self.measure.measure(element, local_s)
+        }
+    }
+
+    /// A board's content size: the stacked extent of its live, measurable
+    /// children. `None` when nothing counts — the caller falls back to
+    /// `Measure` for an empty styled panel.
+    fn board_size(&mut self, element: &ResolvedElement, frame: u32) -> Option<Size> {
+        let mut w = 0.0_f64;
+        let mut h = 0.0_f64;
+        let mut counted = 0usize;
+        for c in &element.children {
+            let range = c.timing.frames;
+            if frame < range.start || frame >= range.end {
+                continue;
+            }
+            if let Some(size) = self.stack_size(c, frame).filter(|s| !s.is_empty()) {
+                w = w.max(size.w);
+                h += size.h;
+                counted += 1;
+            }
+        }
+        (counted > 0).then(|| Size {
+            w: w + BOARD_PAD * 2.0,
+            h: h + BOARD_PAD * 2.0 + BOARD_GAP * (counted - 1) as f64,
+        })
+    }
+
+    /// Place one board child inside the stack: centred horizontally at
+    /// `cursor_y`, rect relative to the board origin. Nested boards
+    /// recurse — their children stack inside the nested rect.
+    fn place_stack_child<'a>(
+        &mut self,
+        child: &'a ResolvedElement,
+        frame: u32,
+        board_w: f64,
+        cursor_y: f64,
+        size: Size,
+    ) -> PlacedElement<'a> {
+        let range = child.timing.frames;
+        let child_local = frame - range.start;
+        let (opacity, transform) = child.anim.map_or((1.0, Transform::IDENTITY), |kind| {
+            anim::evaluate(kind, child_local, range.len())
+        });
+        let rect = Rect {
+            x: (board_w - size.w) / 2.0,
+            y: cursor_y,
+            w: size.w,
+            h: size.h,
+        };
+        let mut children = Vec::new();
+        if matches!(child.kind, ElementKind::Board) {
+            let mut cy = BOARD_PAD;
+            for gc in &child.children {
+                let grange = gc.timing.frames;
+                if frame < grange.start || frame >= grange.end {
+                    continue;
+                }
+                let Some(gsize) = self.stack_size(gc, frame).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                children.push(self.place_stack_child(gc, frame, rect.w, cy, gsize));
+                cy += gsize.h + BOARD_GAP;
+            }
+        }
+        PlacedElement {
+            element: child,
+            rect,
+            fit: Fit::Content,
+            focal: child
+                .placement
+                .unwrap_or(Placement::Named(NamedPlacement::Center)),
+            transform,
+            opacity,
+            local_frame: child_local,
+            z: self.next_z(),
+            children,
+        }
+    }
+
     fn place_one<'a>(
         &mut self,
         element: &'a ResolvedElement,
@@ -150,7 +243,8 @@ impl<'m> Placer<'m> {
     ) -> Option<PlacedElement<'a>> {
         // Measure children once — the board's own size and each child's
         // rect both derive from the same measurements. Only children live
-        // at this frame count toward the stack.
+        // at this frame count toward the stack. Nested boards measure
+        // through `stack_size`, not the flat `Measure`.
         let child_sizes: Vec<Option<Size>> = if matches!(element.kind, ElementKind::Board) {
             element
                 .children
@@ -158,8 +252,7 @@ impl<'m> Placer<'m> {
                 .map(|c| {
                     let range = c.timing.frames;
                     if frame >= range.start && frame < range.end {
-                        let local_s = f64::from(frame - range.start) / self.fps;
-                        self.measure.measure(c, local_s)
+                        self.stack_size(c, frame)
                     } else {
                         None
                     }
@@ -261,6 +354,7 @@ impl<'m> Placer<'m> {
 
         // Children live inside the board's rect: vertical stack, centred,
         // rects relative to the board origin. Their own anims still apply.
+        // Nested boards recurse — grandchildren are placed, not dropped.
         let mut children = Vec::new();
         if matches!(element.kind, ElementKind::Board) {
             let mut cursor_y = BOARD_PAD;
@@ -269,30 +363,7 @@ impl<'m> Placer<'m> {
                 let Some(size) = size.filter(|s| !s.is_empty()) else {
                     continue;
                 };
-                let range = child.timing.frames;
-                let child_local = frame - range.start;
-                let (child_opacity, child_transform) =
-                    child.anim.map_or((1.0, Transform::IDENTITY), |kind| {
-                        anim::evaluate(kind, child_local, range.len())
-                    });
-                children.push(PlacedElement {
-                    element: child,
-                    rect: Rect {
-                        x: (rect.w - size.w) / 2.0,
-                        y: cursor_y,
-                        w: size.w,
-                        h: size.h,
-                    },
-                    fit: Fit::Content,
-                    focal: child
-                        .placement
-                        .unwrap_or(Placement::Named(NamedPlacement::Center)),
-                    transform: child_transform,
-                    opacity: child_opacity,
-                    local_frame: child_local,
-                    z: self.next_z(),
-                    children: Vec::new(),
-                });
+                children.push(self.place_stack_child(child, frame, rect.w, cursor_y, size));
                 cursor_y += size.h + BOARD_GAP;
             }
         }
@@ -619,6 +690,41 @@ mod tests {
         assert_eq!(board.children[0].rect.y, 24.0);
         assert_eq!(board.children[1].rect.y, 24.0 + 50.0 + 16.0);
         assert_eq!(board.children[0].rect.x, (board.rect.w - 200.0) / 2.0);
+    }
+
+    #[test]
+    fn nested_boards_recurse() {
+        // board > board > text — the inner board sizes from its own
+        // stack (not Measure), and grandchildren are placed, not dropped.
+        let mut inner = element(ElementKind::Board, None, None);
+        inner.children.push(element(
+            ElementKind::Text {
+                content: TextContent::Literal("deep".into()),
+            },
+            None,
+            None,
+        ));
+        let mut outer = element(ElementKind::Board, None, None);
+        outer.children.push(inner);
+        let s = scene(vec![outer]);
+
+        let list = layout_frame(&s, 0, &mut StubMeasure);
+        let outer = &list[0];
+        // inner = 200+2*pad × 50+2*pad; outer = inner + 2*pad.
+        let inner_w = 200.0 + 24.0 * 2.0;
+        let inner_h = 50.0 + 24.0 * 2.0;
+        assert_eq!(outer.rect.w, inner_w + 24.0 * 2.0);
+        assert_eq!(outer.rect.h, inner_h + 24.0 * 2.0);
+        assert_eq!(outer.children.len(), 1);
+        let inner = &outer.children[0];
+        assert!(matches!(inner.element.kind, ElementKind::Board));
+        assert_eq!(inner.rect.w, inner_w);
+        assert_eq!(inner.children.len(), 1, "grandchildren are placed");
+        let text = &inner.children[0];
+        assert!(matches!(text.element.kind, ElementKind::Text { .. }));
+        // Grandchild sits at the inner board's pad offset, centred.
+        assert_eq!(text.rect.y, 24.0);
+        assert_eq!(text.rect.x, (inner_w - 200.0) / 2.0);
     }
 
     #[test]

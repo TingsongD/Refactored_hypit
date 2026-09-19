@@ -77,6 +77,11 @@ impl TimingSource {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TimingMap {
     pub sources: BTreeMap<String, TimingSource>,
+    /// Content hash of the script these timings were aligned against —
+    /// `scene_ir::script_fingerprint`. Present on `engine align` output;
+    /// absent on hand-written or older files (no freshness check then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_hash: Option<String>,
 }
 
 impl TimingMap {

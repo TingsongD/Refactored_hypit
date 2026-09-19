@@ -178,9 +178,13 @@ impl<'a> Renderer<'a> {
                 self.draw_cover(dst, &frame, rect, placed.focal);
             }
             ElementKind::Image { src } => {
-                if let Some(frame) = self.images.sample(src, 0, 0.0) {
-                    self.draw_cover(dst, &frame, rect, placed.focal);
-                }
+                // Same contract as Clip/Program: a missing asset draws the
+                // placeholder so the hole is visible, not a silent skip.
+                let frame = self
+                    .images
+                    .sample(src, 0, 0.0)
+                    .unwrap_or_else(|| placeholder_frame(rect.w as u32, rect.h as u32));
+                self.draw_cover(dst, &frame, rect, placed.focal);
             }
             ElementKind::Board => {
                 fill_rounded(dst, rect, PANEL);
@@ -320,7 +324,13 @@ impl<'a> Renderer<'a> {
         let Some(size) = tiny_skia::IntSize::from_wh(frame.width, frame.height) else {
             return;
         };
-        let Some(src) = Pixmap::from_vec(frame.pixels.clone(), size) else {
+        // Frame sources deliver straight-alpha RGBA (ffmpeg `-pix_fmt
+        // rgba`, `image::to_rgba8`); tiny-skia pixmaps are premultiplied.
+        // Without this a half-transparent pixel composites at full
+        // brightness — straight (255,0,0,128) must arrive as (128,0,0,128).
+        let mut pixels = frame.pixels.clone();
+        premultiply(&mut pixels);
+        let Some(src) = Pixmap::from_vec(pixels, size) else {
             return;
         };
         let paint = PixmapPaint {
@@ -440,6 +450,18 @@ fn rounded_rect_path(rect: tiny_skia::Rect, radius: f32) -> Option<tiny_skia::Pa
     pb.quad_to(l, t, l + radius, t);
     pb.close();
     pb.finish()
+}
+
+/// Straight-alpha RGBA → premultiplied (round-to-nearest). ffmpeg's
+/// `-pix_fmt rgba` and `image::to_rgba8` both deliver straight alpha;
+/// tiny-skia's pixmap contract is premultiplied.
+fn premultiply(pixels: &mut [u8]) {
+    for px in pixels.chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        px[0] = ((u32::from(px[0]) * a + 127) / 255) as u8;
+        px[1] = ((u32::from(px[1]) * a + 127) / 255) as u8;
+        px[2] = ((u32::from(px[2]) * a + 127) / 255) as u8;
+    }
 }
 
 fn fill_rounded(pixmap: &mut Pixmap, rect: Rect, color: Color) {

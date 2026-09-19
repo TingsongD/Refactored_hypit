@@ -3,8 +3,8 @@
 //! `ResolvedScene` + `TimingMap` → `layout_frame` draw list → tiny-skia
 //! pixmap → premultiplied RGBA → NV12 for the encoder. Text is shaped by
 //! cosmic-text; media frames arrive through the `FrameSource` seam; work
-//! is sharded by `render_frames` — same inputs, same bytes, any worker
-//! count.
+//! is sharded by `render_frames_into` — frames stream to the consumer in
+//! order over bounded per-shard channels, same bytes at any worker count.
 
 mod media;
 mod nv12;
@@ -16,9 +16,11 @@ use scene_ir::ElementKind;
 use scene_layout::{Measure, Size};
 use scene_time::{ResolvedElement, ResolvedScene, TimingMap};
 
-pub use media::{FrameSource, SeqFrameSource, StillFrameSource, decode_still, placeholder_frame};
+pub use media::{
+    FrameSource, SeqFrameSource, StillFrameSource, WarnSink, decode_still, placeholder_frame,
+};
 pub use nv12::rgba_to_nv12;
-pub use pool::{RenderedFrame, RendererFactory, render_frames};
+pub use pool::{RenderedFrame, RendererFactory, render_frames, render_frames_into};
 pub use raster::{CAPTION_SIZE_PX, Renderer, TEXT_SIZE_PX, TEXT_WRAP};
 pub use text::{CosmicText, RichSpan, TextEngine};
 

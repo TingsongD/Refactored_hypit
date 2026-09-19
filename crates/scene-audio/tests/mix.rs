@@ -125,6 +125,46 @@ fn two_sines_mix_to_program_length() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The finding's exact repro: a 0.5s sting inside a 3s program must mix
+/// to a 3s WAV — otherwise the muxer's `-shortest` cuts the video to
+/// 0.5s. `apad` fills the tail with silence.
+#[test]
+fn short_clip_pads_to_program_length() {
+    if !gated() {
+        return;
+    }
+    let dir = tempdir("pad");
+    let sting = sine(&dir, "sting.wav", 440, 1); // 1s file, 0.5s window
+    let out = dir.join("mix.wav");
+    let graph = AudioGraph {
+        clips: vec![AudioClip {
+            src: sting,
+            target: SampleRange {
+                start: 0,
+                end: PROGRAM_RATE / 2,
+            },
+            src_start_s: 0.0,
+            gain_db: 0.0,
+            fade: Fade::default(),
+            track_id: "voice".into(),
+            span: Span::new(0, 0),
+        }],
+        duck: Vec::new(),
+        program_samples: 3 * PROGRAM_RATE,
+    };
+    mix_program(&graph, &out).unwrap();
+    let info = probe(&out).unwrap();
+    assert!(
+        (info.duration_s - 3.0).abs() < 0.05,
+        "mix must span the program, got {}s",
+        info.duration_s
+    );
+    // The tail really is silence — padding, not a stretched clip.
+    let tail = segment_level(&out, 1.5, 2.8, false);
+    assert!(tail < -60.0, "tail should be silent, got {tail} dB");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn ducking_actually_ducks() {
     if !gated() {

@@ -60,13 +60,16 @@ engine render main.scene
 ## What to check
 
 - **Determinism**: the same `f` must emit the same ops. Anything
-  time-seeded or random makes frames worker-count-dependent.
+  time-seeded or random makes frames run-dependent.
 - **Bad ops degrade, not crash**: a malformed op is dropped; the rest
   still draw. A script that fails to load draws the broken-media
   placeholder, not a panic.
-- **Limits**: runaway loops and memory hogs are aborted (~20k
-  instruction ticks). If your render needs more, it's doing too much
+- **Limits**: `setup` and each `render` call get their own instruction
+  budget (~20k ticks). If your render needs more, it's doing too much
   per frame — precompute in `setup`.
-- **State**: `d` is the same object across `setup`/`render` — fine for
-  derived config. For anything frame-varying derive it from `f`, not
-  from counters on `d` (workers render interleaved frame ranges).
+- **State**: `d` is the same object across `setup`/`render`, and
+  `render` calls replay in frame order even when workers shard the
+  range — counters on `d` are deterministic at any worker count. Note
+  they reflect the *rendered* range: under `--frames a:b`, `f` starts
+  at the window's first frame. Prefer deriving frame-varying values
+  from `f` directly — clearer, and unaffected by the window.

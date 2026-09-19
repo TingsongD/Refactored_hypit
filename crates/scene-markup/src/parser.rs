@@ -47,13 +47,13 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self
-            .rest()
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace())
+        // Advance by the char's full width — a multibyte whitespace
+        // (e.g. U+00A0) bumped as one byte leaves `pos` mid-char and the
+        // next `rest()` slice panics.
+        while let Some(c) = self.rest().chars().next()
+            && c.is_whitespace()
         {
-            self.bump(1);
+            self.bump(c.len_utf8());
         }
     }
 
@@ -289,6 +289,17 @@ mod tests {
         let kids: Vec<_> = node.element_children().collect();
         assert_eq!(kids.len(), 2);
         assert_eq!(node.text_content().unwrap().0, "tail");
+    }
+
+    #[test]
+    fn multibyte_whitespace_does_not_corrupt_the_cursor() {
+        // U+00A0 is whitespace but two bytes — bumping one byte leaves
+        // the cursor mid-char and the next slice panics.
+        let node = parse("<a\u{00A0}x=\"1\"\u{00A0}\u{2003}/>").unwrap();
+        assert_eq!(node.attr("x").unwrap().value, "1");
+        // Same between elements.
+        let node = parse("<a>\u{00A0}<b/></a>").unwrap();
+        assert_eq!(node.element_children().count(), 1);
     }
 
     #[test]

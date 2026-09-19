@@ -37,3 +37,13 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # Runner images ship ffmpeg — the version check fails loudly if
+      # that ever changes, instead of letting the env-gated suite skip.
+      - name: Check FFmpeg
+        run: ffmpeg -version && ffprobe -version
+
+      - name: Test (real media)
+        run: cargo test --workspace
+        env:
+          SCENE_MEDIA_TESTS: "1"

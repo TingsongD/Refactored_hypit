@@ -154,6 +154,12 @@ impl Color {
         let hex = s
             .strip_prefix('#')
             .ok_or_else(|| format!("expected `#rrggbb`, found `{s}`"))?;
+        // Byte-slicing below is only safe on ASCII — reject anything
+        // else up front (`#中` is 3 *bytes*, lands in the 3-arm, and
+        // would slice mid-char).
+        if !hex.is_ascii() {
+            return Err(format!("invalid color `{s}` (hex digits only)"));
+        }
         let byte = |pair: &str| -> Result<u8, String> {
             u8::from_str_radix(pair, 16).map_err(|_| format!("invalid color `{s}`"))
         };
@@ -199,6 +205,30 @@ pub struct ScriptLine {
     pub id: String,
     pub text: String,
     pub span: Span,
+}
+
+/// Stable content hash for staleness checks — FNV-1a over the track name
+/// plus every line's cue id and text. Timing documents written by
+/// `engine align` carry it; a render compares it against the current
+/// script, so editing words without re-aligning produces a diagnostic
+/// instead of silently captioned stale words. Delimiters inside the hash
+/// keep `["ab","c"]` and `["a","bc"]` distinct.
+pub fn script_fingerprint(script: &Script) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    feed(script.track.as_bytes());
+    for line in &script.lines {
+        feed(b"\x00");
+        feed(line.id.as_bytes());
+        feed(b"\x01");
+        feed(line.text.as_bytes());
+    }
+    format!("{h:016x}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -414,6 +444,10 @@ mod tests {
         assert_eq!(Color::parse("#abc").unwrap().a, 255);
         assert_eq!(Color::parse("#11223344").unwrap().a, 0x44);
         assert!(Color::parse("red").is_err());
+        // Non-ASCII hex is an error, not a byte-slice panic — `#中` is
+        // 3 bytes and would land in the #rgb arm mid-char.
+        assert!(Color::parse("#中").is_err());
+        assert!(Color::parse("#ab中").is_err());
     }
 
     #[test]

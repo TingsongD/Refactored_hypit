@@ -64,6 +64,15 @@ pub fn parse_markers(text: &str) -> (Vec<Marker>, Vec<Diagnostic>) {
             ));
             continue;
         };
+        // f64::parse accepts NaN/inf — both serialize as `null` and
+        // produce a timings.json the render side can't read back.
+        if !start_s.is_finite() || !end_s.is_finite() {
+            diags.push(Diagnostic::error(
+                format!("times must be finite numbers: `{line}`"),
+                Some(span),
+            ));
+            continue;
+        }
         if end_s <= start_s {
             diags.push(Diagnostic::error(
                 format!("end must be after start: `{line}`"),

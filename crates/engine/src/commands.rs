@@ -11,7 +11,7 @@ use scene_ir::{Diagnostic, IR_FORMAT};
 use scene_markup::compile;
 use scene_media::Encoder;
 use scene_render::{
-    CosmicText, RenderMeasure, Renderer, SeqFrameSource, StillFrameSource, render_frames,
+    CosmicText, RenderMeasure, Renderer, SeqFrameSource, StillFrameSource, render_frames_into,
     rgba_to_nv12,
 };
 use scene_script::SandboxPrograms;
@@ -346,6 +346,13 @@ pub fn render_inner(
     let Some(scene) = scene.filter(|_| !failed) else {
         return Err(stage("scene has errors".to_string(), bundles));
     };
+    // Missing assets are non-fatal (placeholders draw), but they must be
+    // loud — a silent hole reads as a successful render of broken input.
+    bundles.push(DiagBundle {
+        name: name.clone(),
+        source: source.clone(),
+        diags: asset_warnings(&scene, file.parent().unwrap_or(Path::new("."))),
+    });
 
     let timings = match timings_path {
         Some(path) => {
@@ -366,6 +373,18 @@ pub fn render_inner(
         }
         None => TimingMap::default(),
     };
+
+    // Stale-timing guard: `engine align` stamps the script fingerprint
+    // into the timing document — if it doesn't match the live script,
+    // the words were aligned against different text and captions would
+    // show the old words without a word of complaint.
+    if let Some(d) = stale_timing_warning(&scene, &timings) {
+        bundles.push(DiagBundle {
+            name: name.clone(),
+            source: source.clone(),
+            diags: vec![d],
+        });
+    }
 
     let (resolved, diags) = realize(&scene, &timings);
     let failed = scene_ir::has_errors(&diags);
@@ -418,8 +437,8 @@ pub fn render_inner(
     // under later frames.
     let (graph, audio_diags) = AudioGraph::from_scene(&resolved, &project_root);
     bundles.push(DiagBundle {
-        name,
-        source,
+        name: name.clone(),
+        source: source.clone(),
         diags: audio_diags,
     });
     let fps = resolved.frame_rate.to_f64();
@@ -446,32 +465,66 @@ pub fn render_inner(
         Ok(e) => e,
         Err(e) => return Err(stage(e.to_string(), bundles)),
     };
-    let make = renderer_factory(project_root.clone());
+    // Decode-time asset failures — a file that exists but won't open, a
+    // corrupt png — are recorded by each worker's frame sources into one
+    // shared sink, then reported once per asset.
+    let warn_sink: scene_render::WarnSink = Default::default();
+    let make = renderer_factory(project_root.clone(), warn_sink.clone());
 
-    let rendered = match render_frames(&resolved, &timings, range, workers.max(1), &make) {
-        Ok(r) => r,
-        Err(e) => return Err(stage(format!("render worker failed: {e}"), bundles)),
-    };
-    let (w, h) = (resolved.canvas.width, resolved.canvas.height);
-    for frame in &rendered {
-        if let Err(e) = encoder.write_frame(&rgba_to_nv12(&frame.pixels, w, h)) {
-            // The encoder opened with -y: the target is already truncated
-            // — remove the corpse so nothing serves a partial video.
-            let _ = fs::remove_file(&target);
-            return Err(stage(
-                format!("encode failed at frame {}: {e}", frame.index),
-                bundles,
-            ));
-        }
+    // Frames stream straight into the encoder as workers finish them —
+    // no whole-video frame buffer. On any failure the pool cancels its
+    // workers and joins them before returning Err; Encoder::drop kills
+    // ffmpeg, and the -y-truncated target is a corpse — remove it so
+    // nothing serves a partial video.
+    let (cw, ch) = (resolved.canvas.width, resolved.canvas.height);
+    let frames_done =
+        match render_frames_into(&resolved, &timings, range, workers.max(1), &make, |f| {
+            encoder
+                .write_frame(&rgba_to_nv12(&f.pixels, cw, ch))
+                .map_err(|e| format!("encode failed at frame {}: {e}", f.index))
+        }) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = fs::remove_file(&target);
+                return Err(stage(e, bundles));
+            }
+        };
+    if let Ok(w) = warn_sink.lock()
+        && !w.is_empty()
+    {
+        bundles.push(DiagBundle {
+            name: name.clone(),
+            source: source.clone(),
+            diags: w
+                .iter()
+                .map(|m| Diagnostic::warning(m.clone(), None))
+                .collect(),
+        });
     }
     if let Err(e) = encoder.finish() {
         let _ = fs::remove_file(&target);
         return Err(stage(e.to_string(), bundles));
     }
     Ok(RenderReport {
-        frames: rendered.len(),
+        frames: frames_done,
         target,
         bundles,
+    })
+}
+
+/// Some when the timing file carries an align-time script fingerprint
+/// that doesn't match the live script — same cue ids, different words.
+/// Files with no fingerprint (hand-written, older) can't be checked.
+fn stale_timing_warning(scene: &scene_ir::Scene, timings: &TimingMap) -> Option<Diagnostic> {
+    let script = scene.script.as_ref()?;
+    let hash = timings.script_hash.as_deref()?;
+    (hash != scene_ir::script_fingerprint(script)).then(|| {
+        Diagnostic::warning(
+            "timings were aligned to a different script — re-run `engine align` \
+             or captions will render stale words"
+                .to_string(),
+            None,
+        )
     })
 }
 
@@ -521,6 +574,7 @@ fn parse_frame_range(spec: &str) -> Option<std::ops::Range<u32>> {
 /// `render_frames` unifies them under — a bare closure can't express that.
 fn renderer_factory<'a>(
     project_root: PathBuf,
+    warnings: scene_render::WarnSink,
 ) -> impl Fn(&'a scene_time::ResolvedScene, &'a TimingMap) -> Renderer<'a> + Send + Sync + 'static {
     move |scene, timings| Renderer {
         scene,
@@ -531,8 +585,10 @@ fn renderer_factory<'a>(
             text: Box::new(CosmicText::new()),
         }),
         text: Box::new(CosmicText::new()),
-        clips: Box::new(SeqFrameSource::new(project_root.clone())),
-        images: Box::new(StillFrameSource::new(project_root.clone())),
+        clips: Box::new(SeqFrameSource::new(project_root.clone()).with_warnings(warnings.clone())),
+        images: Box::new(
+            StillFrameSource::new(project_root.clone()).with_warnings(warnings.clone()),
+        ),
         programs: Box::new(SandboxPrograms::new(project_root.clone())),
     }
 }
@@ -818,5 +874,43 @@ mod tests {
         // Absolute source inside the project still relativizes.
         let under = cwd.join("assets").join("v.mp4");
         assert_eq!(adapt_src(&under, Path::new(".")), "assets/v.mp4");
+    }
+
+    fn scene_with_script(text: &str) -> scene_ir::Scene {
+        let src = format!(
+            r##"<scene canvas="1x1" fps="30">
+  <track id="voice" kind="audio"><sound src="n.wav" during="hook"/></track>
+  <script track="voice"><line id="hook">{text}</line></script>
+</scene>"##
+        );
+        let doc = scene_markup::parse_document(&src).unwrap();
+        let (scene, diags) = scene_markup::lower(&doc);
+        assert!(!scene_ir::has_errors(&diags), "{diags:?}");
+        scene.unwrap()
+    }
+
+    #[test]
+    fn stale_timing_fingerprint_warns() {
+        // Timings aligned to "Hello." must not silently serve a scene
+        // whose hook now says different words.
+        let scene = scene_with_script("Hello.");
+        let mut timings = TimingMap {
+            script_hash: Some(scene_ir::script_fingerprint(scene.script.as_ref().unwrap())),
+            ..Default::default()
+        };
+        assert!(stale_timing_warning(&scene, &timings).is_none());
+
+        let edited = scene_with_script("Totally different words.");
+        assert!(
+            stale_timing_warning(&edited, &timings).is_some(),
+            "edited script must trip the fingerprint check"
+        );
+        // No fingerprint at all → nothing to compare, no warning.
+        timings.script_hash = None;
+        assert!(stale_timing_warning(&edited, &timings).is_none());
+        // No script → nothing stale can exist.
+        let mut bare = scene_with_script("x");
+        bare.script = None;
+        assert!(stale_timing_warning(&bare, &timings).is_none());
     }
 }

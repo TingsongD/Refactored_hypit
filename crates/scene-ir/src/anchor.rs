@@ -202,18 +202,43 @@ impl Anchor {
     }
 }
 
+/// Does this anchor expression carry an explicit `.start`/`.end`
+/// suffix? The range defaults (start edge on the left, end edge on the
+/// right) apply only when the author didn't pick an edge.
+fn explicit_edge(s: &str) -> Option<Edge> {
+    let s = s.trim();
+    if s.as_bytes().first()?.is_ascii_digit() {
+        return None; // literal anchor — no cue edge
+    }
+    let n = ident_len(s);
+    let rest = &s[n..];
+    if rest.starts_with(".start") {
+        Some(Edge::Start)
+    } else if rest.starts_with(".end") {
+        Some(Edge::End)
+    } else {
+        None
+    }
+}
+
 impl AnchorRange {
     /// `a..b` runs from the start edge of `a` to the end edge of `b`;
-    /// a lone `a` is the whole span of `a`.
+    /// a lone `a` is the whole span of `a`. Explicit `.start`/`.end`
+    /// suffixes win over the positional defaults, so `hook.end..payoff.start`
+    /// means the gap between the cues.
     pub fn parse(s: &str) -> Result<AnchorRange, String> {
         let s = s.trim();
         if let Some((left, right)) = s.split_once("..") {
             let mut start = Anchor::parse(left)?;
             let mut end = Anchor::parse(right)?;
-            if let Anchor::Cue { edge, .. } = &mut start {
+            if explicit_edge(left).is_none()
+                && let Anchor::Cue { edge, .. } = &mut start
+            {
                 *edge = Edge::Start;
             }
-            if let Anchor::Cue { edge, .. } = &mut end {
+            if explicit_edge(right).is_none()
+                && let Anchor::Cue { edge, .. } = &mut end
+            {
                 *edge = Edge::End;
             }
             Ok(AnchorRange { start, end })
@@ -394,6 +419,32 @@ mod tests {
                 offset: None
             }
         );
+    }
+
+    #[test]
+    fn explicit_edges_survive_range_defaults() {
+        // `hook.end..payoff.start` is the gap *between* the cues, not a
+        // span covering both — explicit edges beat positional defaults.
+        let r = AnchorRange::parse("hook.end..payoff.start").unwrap();
+        let Anchor::Cue { edge: se, .. } = &r.start else {
+            panic!()
+        };
+        let Anchor::Cue { edge: ee, .. } = &r.end else {
+            panic!()
+        };
+        assert_eq!((*se, *ee), (Edge::End, Edge::Start));
+
+        // Mixed forms: the unspecified side still gets its default.
+        let r = AnchorRange::parse("hook.end..payoff").unwrap();
+        let Anchor::Cue { edge: ee, .. } = &r.end else {
+            panic!()
+        };
+        assert_eq!(*ee, Edge::End);
+        let r = AnchorRange::parse("hook..payoff.start").unwrap();
+        let Anchor::Cue { edge: se, .. } = &r.start else {
+            panic!()
+        };
+        assert_eq!(*se, Edge::Start);
     }
 
     #[test]

@@ -19,6 +19,8 @@ engine init myvideo          # scaffold scene.toml + main.scene + assets/
 engine check main.scene      # validate: every error has a source span
 engine align main.scene --markers markers.txt --out timings.json
 engine render main.scene --timings timings.json --out out/final.mp4
+engine render main.scene --frames 60:120    # a window; audio rebases to it
+engine render main.scene --frames 90        # exactly one frame
 ```
 
 External tools: `ffmpeg` + `ffprobe` are required for render; `yt-dlp`
@@ -95,6 +97,11 @@ function render(ctx, f, d) {                  // f = local frame
 `ctx.w`/`ctx.h` are the element's box (the canvas by default). Ops:
 `rect(x,y,w,h)`, `circle(x,y,r)`, `text(str,x,y)` — all in the current
 fill color. Malformed ops are dropped, never fatal.
+
+`render` is called once per frame in order — state accumulated on `d`
+is deterministic at any worker count (shard prefixes replay before a
+worker starts mid-range). Under `--frames a:b`, `f` and `d` see the
+window only, not the full program.
 
 ## Adapt (existing footage → draft scene)
 
