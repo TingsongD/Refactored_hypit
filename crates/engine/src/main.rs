@@ -1,5 +1,6 @@
 mod commands;
 mod report;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,6 +69,18 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Localhost test UI: edit markup, check, render, watch the result.
+    Ui {
+        /// Project dir containing assets/ (+ main.scene, timings.json).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Port to bind on localhost.
+        #[arg(long, default_value_t = 8484)]
+        port: u16,
+        /// Don't auto-open the browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Inspect or invoke capabilities declared in a scene.toml.
     Cap {
         /// Path to the project's scene.toml.
@@ -131,6 +144,7 @@ fn main() -> ExitCode {
             out_dir,
             out,
         } => commands::adapt(source, out_dir, out.as_deref()),
+        Cmd::Ui { dir, port, no_open } => ui::serve(dir, *port, !no_open),
         Cmd::Cap { config, action } => match action {
             CapCmd::List => commands::cap_list(config),
             CapCmd::Call { name, params, out } => commands::cap_call(config, name, params, out),

@@ -160,6 +160,27 @@ mod tests {
         assert!(errors.is_empty());
     }
 
+    #[test]
+    fn source_fps_carries_through_to_the_draft() {
+        // NTSC 29.97 stays an exact rational.
+        let mut a = analysis(&[], false);
+        a.fps = Some((30000, 1001));
+        let markup = emit_scene("v.mp4", &a);
+        assert!(markup.contains("fps=\"30000/1001\""), "{markup}");
+        let (scene, errors) = lower_emitted(&markup);
+        assert!(errors.is_empty(), "{errors:?}");
+        let rate = scene.unwrap().frame_rate;
+        assert_eq!((rate.numerator, rate.denominator), (30000, 1001));
+
+        // 24fps source → 24fps scene.
+        a.fps = Some((24, 1));
+        assert!(emit_scene("v.mp4", &a).contains("fps=\"24/1\""));
+
+        // Unknown rate falls back to 30.
+        a.fps = None;
+        assert!(emit_scene("v.mp4", &a).contains("fps=\"30\""));
+    }
+
     // --- gated: real ffmpeg ------------------------------------------------
 
     fn gated() -> bool {

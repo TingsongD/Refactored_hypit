@@ -66,6 +66,24 @@ impl Lower {
         }
     }
 
+    /// Required `src` plus a parent-dir advisory — a project is meant to
+    /// be self-contained, so `../` paths that escape the root are worth
+    /// flagging even though authored scenes are trusted. URLs pass.
+    fn src_attr<'a>(&mut self, node: &'a RawNode) -> Option<&'a RawAttr> {
+        let attr = self.req_attr(node, "src")?;
+        if !attr.value.contains("://")
+            && std::path::Path::new(&attr.value)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            self.warning(
+                attr.value_span,
+                "src path contains `..` — it may escape the project root".to_string(),
+            );
+        }
+        Some(attr)
+    }
+
     /// Warn on attributes outside `allowed` so the vocabulary stays honest
     /// but forward-compatible.
     fn check_attrs(&mut self, node: &RawNode, allowed: &[&str]) {
@@ -267,13 +285,13 @@ impl Lower {
         let kind = match node.name.as_str() {
             "clip" => {
                 self.check_attrs(node, &with_common(&["src"]));
-                self.req_attr(node, "src").map(|a| ElementKind::Clip {
+                self.src_attr(node).map(|a| ElementKind::Clip {
                     src: a.value.clone(),
                 })
             }
             "image" => {
                 self.check_attrs(node, &with_common(&["src"]));
-                self.req_attr(node, "src").map(|a| ElementKind::Image {
+                self.src_attr(node).map(|a| ElementKind::Image {
                     src: a.value.clone(),
                 })
             }
@@ -333,7 +351,7 @@ impl Lower {
             }
             "music" | "sound" => {
                 self.check_attrs(node, &with_common(&["src", "gain", "duck"]));
-                let src = self.req_attr(node, "src").map(|a| a.value.clone());
+                let src = self.src_attr(node).map(|a| a.value.clone());
                 let gain_db = self.parse_attr(node, "gain", parse_gain_db).unwrap_or(0.0);
                 let duck = node.attr("duck").map(|a| a.value.clone());
                 src.map(|src| {
@@ -352,10 +370,13 @@ impl Lower {
             }
             "program" => {
                 self.check_attrs(node, &with_common(&["src", "with"]));
-                let src = self.req_attr(node, "src").map(|a| a.value.clone());
+                let src = self.src_attr(node).map(|a| a.value.clone());
                 let with = node.attr("with").map(|a| a.value.clone());
                 if let Some(w) = &with
-                    && serde_json::from_str::<serde_json::Value>(w).is_err()
+                    && !matches!(
+                        serde_json::from_str::<serde_json::Value>(w),
+                        Ok(serde_json::Value::Object(_))
+                    )
                 {
                     self.error(
                         node.attr("with").unwrap().name_span,
@@ -723,5 +744,29 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("JSON object literal"))
         );
+    }
+
+    #[test]
+    fn program_rejects_non_object_with() {
+        for bad in ["5", "\"x\"", "[1,2]", "null"] {
+            let src = SCENE.replace(
+                "<clip src=\"a.mp4\" during=\"hook..payoff\"/>",
+                &format!(r#"<program src="fx.js" with='{bad}'/>"#),
+            );
+            let (_, diags) = lower_str(&src);
+            assert!(
+                errors(&diags)
+                    .iter()
+                    .any(|m| m.contains("JSON object literal")),
+                "with={bad} should error: {diags:?}"
+            );
+        }
+        // An empty object is still an object.
+        let ok = SCENE.replace(
+            "<clip src=\"a.mp4\" during=\"hook..payoff\"/>",
+            r#"<program src="fx.js" with='{}'/>"#,
+        );
+        let (_, diags) = lower_str(&ok);
+        assert!(errors(&diags).is_empty());
     }
 }

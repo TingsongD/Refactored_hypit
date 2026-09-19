@@ -82,7 +82,8 @@ Common attributes: `during`, `at` (`center|top|bottom|left|right` or
 fs, no process, CPU/memory-capped. Ops land in a `ctx` canvas:
 
 ```js
-function setup(d) { d.phase = 0; }            // once; `with` JSON → d.with
+function setup(d) { d.phase = 0; }            // once; `d` is the `with` object —
+                                            // fields you set here persist into render
 function render(ctx, f, d) {                  // f = local frame
   ctx.setFill('#ff4466');                     // persistent state
   ctx.setFont(28);

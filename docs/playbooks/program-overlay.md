@@ -11,7 +11,7 @@ rasters them. No fs, no network, capped CPU and memory.
 
 ```js
 function setup(d) {
-  d.total = (d.with && d.with.seconds || 6) * 30; // frames
+  d.total = (d.seconds || 6) * 30;   // `with` payload becomes `d` — stash derived state here
 }
 
 function render(ctx, f, d) {
@@ -29,10 +29,11 @@ function render(ctx, f, d) {
 }
 ```
 
-`setup(d)` runs once per render worker — stash constants on `d`.
+`setup(d)` runs once per render worker — stash derived state on `d`.
 `render(ctx, f, d)` runs per frame; `f` is the element-local frame
-(first live frame = 0). `ctx.with`… no — the `with` JSON rides on `d`:
-`d.with` is whatever the markup's `with='{...}'` attribute carried.
+(first live frame = 0). `d` is the `with` JSON object itself —
+`with='{"seconds": 6}'` arrives as `d.seconds`, and anything you add
+in `setup` is still there in `render`.
 
 Ops are element-local: `(0,0)` is the element's top-left, and
 `ctx.w`/`ctx.h` report its box. A program with no `at` covers the
@@ -66,6 +67,6 @@ engine render main.scene
 - **Limits**: runaway loops and memory hogs are aborted (~20k
   instruction ticks). If your render needs more, it's doing too much
   per frame — precompute in `setup`.
-- **State**: `d` persists between frames on a worker; workers each get
-  their own sandbox. Never depend on `d` for correctness across
-  *frames* — derive everything from `f`.
+- **State**: `d` is the same object across `setup`/`render` — fine for
+  derived config. For anything frame-varying derive it from `f`, not
+  from counters on `d` (workers render interleaved frame ranges).

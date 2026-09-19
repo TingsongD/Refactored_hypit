@@ -54,23 +54,55 @@ impl FrameStream {
         height: u32,
         fps: f64,
     ) -> Result<Self, MediaError> {
+        Self::spawn(
+            path,
+            info,
+            &[],
+            Some(format!("scale={width}:{height},fps={fps}")),
+            (width, height),
+        )
+    }
+
+    /// Open with a caller-supplied probe result plus extra ffmpeg input
+    /// args (e.g. `["-ss", "1.5"]` placed before `-i`).
+    pub fn open_with(
+        path: &Path,
+        info: &MediaInfo,
+        pre_input_args: &[&str],
+    ) -> Result<Self, MediaError> {
+        let video = info.video.as_ref().ok_or(MediaError::NoVideoStream)?;
+        Self::spawn(
+            path,
+            info,
+            pre_input_args,
+            None,
+            (video.width, video.height),
+        )
+    }
+
+    /// The one spawn path: `ffmpeg [pre] -i path [-vf f] -f rawvideo
+    /// -pix_fmt rgba -`, piped. `dims` are the output dims — the
+    /// source's own unless a `-vf scale` shrinks them.
+    fn spawn(
+        path: &Path,
+        info: &MediaInfo,
+        pre_input_args: &[&str],
+        vf: Option<String>,
+        (width, height): (u32, u32),
+    ) -> Result<Self, MediaError> {
         if info.video.is_none() {
             return Err(MediaError::NoVideoStream);
         }
         let tool = std::env::var("FFMPEG").unwrap_or_else(|_| Tool::Ffmpeg.name().to_string());
         let mut cmd = Command::new(&tool);
         cmd.args(["-v", "error"])
+            .args(pre_input_args)
             .arg("-i")
-            .arg(path)
-            .args([
-                "-vf",
-                &format!("scale={width}:{height},fps={fps}"),
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgba",
-                "-",
-            ])
+            .arg(path);
+        if let Some(vf) = &vf {
+            cmd.args(["-vf", vf]);
+        }
+        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -86,40 +118,6 @@ impl FrameStream {
             width,
             height,
             frame_len: Frame::byte_len(width, height),
-            index: 0,
-        })
-    }
-
-    /// Open with a caller-supplied probe result plus extra ffmpeg input
-    /// args (e.g. `["-ss", "1.5"]` placed before `-i`).
-    pub fn open_with(
-        path: &Path,
-        info: &MediaInfo,
-        pre_input_args: &[&str],
-    ) -> Result<Self, MediaError> {
-        let video = info.video.as_ref().ok_or(MediaError::NoVideoStream)?;
-        let tool = std::env::var("FFMPEG").unwrap_or_else(|_| Tool::Ffmpeg.name().to_string());
-        let mut cmd = Command::new(&tool);
-        cmd.args(["-v", "error"])
-            .args(pre_input_args)
-            .arg("-i")
-            .arg(path)
-            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| MediaError::Spawn {
-            tool: "ffmpeg",
-            source: e,
-        })?;
-        let stdout = child.stdout.take().expect("stdout was piped");
-        Ok(FrameStream {
-            child,
-            stdout,
-            info: info.clone(),
-            width: video.width,
-            height: video.height,
-            frame_len: Frame::byte_len(video.width, video.height),
             index: 0,
         })
     }

@@ -30,6 +30,7 @@ engine check myvideo/main.scene   # validate; every error has a source span
 engine adapt clip.mp4 --out draft.scene   # draft a scene from footage
 engine align main.scene --markers m.txt --out timings.json
 engine render main.scene --timings timings.json
+engine ui --dir myvideo           # localhost test UI (edit → check → render → watch)
 ```
 
 ## The idea

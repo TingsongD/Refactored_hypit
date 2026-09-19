@@ -267,52 +267,109 @@ pub fn align(
 
 /// Render a scene to mp4: compile → realize → raster → NV12 → ffmpeg.
 ///
-/// `--timings` is a JSON `TimingMap` (the alignment connector's output
-/// shape). Scenes timed purely by literals need no timings.
-pub fn render(
+/// Diagnostics grouped with the source they point into — one bundle
+/// per file that produced them (scene, markers, etc).
+pub struct DiagBundle {
+    pub name: String,
+    pub source: String,
+    pub diags: Vec<Diagnostic>,
+}
+
+/// What a successful render produced, plus every diagnostic raised
+/// along the way (warnings included — the UI shows them).
+pub struct RenderReport {
+    pub frames: usize,
+    pub target: PathBuf,
+    pub bundles: Vec<DiagBundle>,
+}
+
+/// Why a render failed: a message, plus any diagnostic bundles gathered
+/// before the failure (a `check`-stage failure carries them all).
+pub struct RenderError {
+    pub message: String,
+    pub bundles: Vec<DiagBundle>,
+}
+
+/// The render pipeline with reporting abstracted: diagnostics and
+/// failures come back as data instead of prints, so the CLI can print
+/// them and the UI can ship them as JSON.
+pub fn render_inner(
     file: &Path,
     timings_path: Option<&Path>,
     out: Option<&Path>,
     frames: Option<&str>,
     workers: usize,
-) -> i32 {
-    let (name, source) = match read_source(file) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
+) -> Result<RenderReport, RenderError> {
+    let stage = |msg: String, bundles: Vec<DiagBundle>| RenderError {
+        message: msg,
+        bundles,
+    };
+    let (name, source) = read_source(file).map_err(|e| stage(e.to_string(), Vec::new()))?;
+    let mut bundles = Vec::new();
+
+    let doc = match scene_markup::parse_document(&source) {
+        Ok(d) => d,
+        Err(d) => {
+            return Err(stage(
+                "parse error".to_string(),
+                vec![DiagBundle {
+                    name,
+                    source,
+                    diags: vec![d],
+                }],
+            ));
         }
     };
-    let Some(scene) = compile_and_report(&name, &source) else {
-        return 1;
+    let (scene, diags) = scene_markup::lower(&doc);
+    let failed = scene_ir::has_errors(&diags);
+    bundles.push(DiagBundle {
+        name: name.clone(),
+        source: source.clone(),
+        diags,
+    });
+    let Some(scene) = scene.filter(|_| !failed) else {
+        return Err(stage("scene has errors".to_string(), bundles));
     };
 
     let timings = match timings_path {
-        Some(path) => match fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|json| serde_json::from_str::<TimingMap>(&json).map_err(|e| e.to_string()))
-        {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("error: cannot load timings {}: {e}", path.display());
-                return 1;
+        Some(path) => {
+            let loaded = fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|json| {
+                    serde_json::from_str::<TimingMap>(&json).map_err(|e| e.to_string())
+                });
+            match loaded {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err(stage(
+                        format!("cannot load timings {}: {e}", path.display()),
+                        bundles,
+                    ));
+                }
             }
-        },
+        }
         None => TimingMap::default(),
     };
 
     let (resolved, diags) = realize(&scene, &timings);
-    report::emit(&name, &source, &diags);
-    let Some(resolved) = resolved else {
-        return 1;
+    let failed = scene_ir::has_errors(&diags);
+    bundles.push(DiagBundle {
+        name: name.clone(),
+        source: source.clone(),
+        diags,
+    });
+    let Some(resolved) = resolved.filter(|_| !failed) else {
+        return Err(stage("timing resolution failed".to_string(), bundles));
     };
 
     let range = match frames {
         Some(spec) => match parse_frame_range(spec) {
             Some(r) => r,
             None => {
-                eprintln!("error: invalid --frames `{spec}` (use `start:end`, e.g. `0:90`)");
-                return 1;
+                return Err(stage(
+                    format!("invalid --frames `{spec}` (use `start:end`, e.g. `0:90`)"),
+                    bundles,
+                ));
             }
         },
         None => resolved.program.frames.start..resolved.program.frames.end,
@@ -321,15 +378,19 @@ pub fn render(
     let target = match out.or_else(|| resolved_tracks_target(&scene)) {
         Some(t) => t.to_path_buf(),
         None => {
-            eprintln!("error: no output target — pass --out or set <render target>");
-            return 1;
+            return Err(stage(
+                "no output target — pass --out or set <render target>".to_string(),
+                bundles,
+            ));
         }
     };
     if let Some(parent) = target.parent()
         && let Err(e) = fs::create_dir_all(parent)
     {
-        eprintln!("error: cannot create {}: {e}", parent.display());
-        return 1;
+        return Err(stage(
+            format!("cannot create {}: {e}", parent.display()),
+            bundles,
+        ));
     }
 
     let project_root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -337,14 +398,17 @@ pub fn render(
     // Program audio: collect music/sound → 48kHz mix → muxed into the
     // same ffmpeg process as the video pipe. No audio elements = silent.
     let (graph, audio_diags) = AudioGraph::from_scene(&resolved, &project_root);
-    report::emit(&name, &source, &audio_diags);
+    bundles.push(DiagBundle {
+        name,
+        source,
+        diags: audio_diags,
+    });
     let program_wav = if graph.clips.is_empty() {
         None
     } else {
         let wav = target.with_extension("program.wav");
         if let Err(e) = mix_program(&graph, &wav) {
-            eprintln!("error: audio mix failed: {e}");
-            return 1;
+            return Err(stage(format!("audio mix failed: {e}"), bundles));
         }
         Some(wav)
     };
@@ -357,10 +421,7 @@ pub fn render(
         program_wav.as_deref(),
     ) {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
-        }
+        Err(e) => return Err(stage(e.to_string(), bundles)),
     };
     let make = renderer_factory(project_root.clone());
 
@@ -368,23 +429,54 @@ pub fn render(
     let (w, h) = (resolved.canvas.width, resolved.canvas.height);
     for frame in &rendered {
         if let Err(e) = encoder.write_frame(&rgba_to_nv12(&frame.pixels, w, h)) {
-            eprintln!("error: encode failed at frame {}: {e}", frame.index);
-            return 1;
+            return Err(stage(
+                format!("encode failed at frame {}: {e}", frame.index),
+                bundles,
+            ));
         }
     }
     if let Err(e) = encoder.finish() {
-        eprintln!("error: {e}");
-        return 1;
+        return Err(stage(e.to_string(), bundles));
     }
     if let Some(wav) = &program_wav {
         let _ = fs::remove_file(wav);
     }
-    println!(
-        "rendered {} frame(s) → {}",
-        rendered.len(),
-        target.display()
-    );
-    0
+    Ok(RenderReport {
+        frames: rendered.len(),
+        target,
+        bundles,
+    })
+}
+
+/// `engine render` — the CLI view over [`render_inner`]: diagnostics
+/// rendered with spans, failures as exit codes.
+pub fn render(
+    file: &Path,
+    timings_path: Option<&Path>,
+    out: Option<&Path>,
+    frames: Option<&str>,
+    workers: usize,
+) -> i32 {
+    match render_inner(file, timings_path, out, frames, workers) {
+        Ok(report) => {
+            for b in &report.bundles {
+                report::emit(&b.name, &b.source, &b.diags);
+            }
+            println!(
+                "rendered {} frame(s) → {}",
+                report.frames,
+                report.target.display()
+            );
+            0
+        }
+        Err(err) => {
+            for b in &err.bundles {
+                report::emit(&b.name, &b.source, &b.diags);
+            }
+            eprintln!("error: {}", err.message);
+            1
+        }
+    }
 }
 
 fn parse_frame_range(spec: &str) -> Option<std::ops::Range<u32>> {

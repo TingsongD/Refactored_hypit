@@ -25,9 +25,16 @@ pub fn emit_scene(src: &str, a: &Analysis) -> String {
     let dur = a.duration_s.max(0.1);
     let src = esc_attr(src);
 
+    // Carry the source rate through so playback speed matches what was
+    // analyzed; NTSC rates stay exact rationals. Unknown → 30.
+    let fps = match a.fps {
+        Some((n, d)) if n > 0 && d > 0 => format!("{n}/{d}"),
+        _ => "30".to_string(),
+    };
+
     let mut out = String::new();
     out.push_str(&format!(
-        "<scene canvas=\"{w}x{h}\" fps=\"30\" clear=\"#000\">\n"
+        "<scene canvas=\"{w}x{h}\" fps=\"{fps}\" clear=\"#000\">\n"
     ));
     out.push_str("  <track kind=\"visual\">\n");
     out.push_str(&format!(

@@ -36,12 +36,13 @@ pub enum ScriptError {
 const PRELUDE: &str = r#"
 var __ops = [];
 var __setup_done = false;
+var __data = null;
 var ctx = {
   w: 0, h: 0,
   fill: '#ffffffff',
   size: 32,
   setFill(c) { this.fill = c; },
-  setFontSize(s) { this.size = s; },
+  setFont(s) { this.size = s; },
   rect(x, y, w, h) { __ops.push({op:'rect', x, y, w, h, c: this.fill}); },
   circle(x, y, r) { __ops.push({op:'circle', x, y, r, c: this.fill}); },
   text(t, x, y) { __ops.push({op:'text', t, x, y, size: this.size, c: this.fill}); },
@@ -49,11 +50,15 @@ var ctx = {
 function __run(frame, dataJson, w, h) {
   __ops.length = 0;
   ctx.w = w; ctx.h = h;
-  var data = JSON.parse(dataJson);
-  if (!__setup_done && typeof setup === 'function') { setup(data); }
-  __setup_done = true;
+  // `with` parses once at setup — `d` is the same object every frame, so
+  // state stashed on it in setup() reaches render() as documented.
+  if (!__setup_done) {
+    __data = JSON.parse(dataJson);
+    if (typeof setup === 'function') { setup(__data); }
+    __setup_done = true;
+  }
   if (typeof render !== 'function') { throw new Error('program must define render(ctx, frame, data)'); }
-  render(ctx, frame, data);
+  render(ctx, frame, __data);
   return JSON.stringify(__ops);
 }
 "#;
@@ -94,14 +99,15 @@ impl Program {
 
     /// Evaluate the program for one local frame. `data_json` is the
     /// element's `with` payload (already JSON); `w`,`h` are the
-    /// element's box so scripts can lay out relative to it.
+    /// element's box so scripts can lay out relative to it. Returns the
+    /// ops plus how many were dropped as malformed.
     pub fn render(
         &mut self,
         frame: u32,
         data_json: &str,
         w: f64,
         h: f64,
-    ) -> Result<DrawList, ScriptError> {
+    ) -> Result<(DrawList, usize), ScriptError> {
         self.budget.set(INSTRUCTION_BUDGET);
         let data = if data_json.is_empty() {
             "{}"
@@ -116,7 +122,7 @@ impl Program {
                 ctx.eval::<String, _>(format!("__run({frame}, {}, {w}, {h})", js_str(data)))
             })
             .map_err(|e| ScriptError::Eval(e.to_string()))?;
-        Ok(DrawList::from_json(&json).0)
+        Ok(DrawList::from_json(&json))
     }
 }
 
@@ -148,12 +154,26 @@ pub trait ProgramSource {
     fn ops(&mut self, src: &str, local_frame: u32, with: &str, w: f64, h: f64) -> Option<DrawList>;
 }
 
+/// Per-script state: load failures cache so a broken program fails once
+/// instead of once per frame; eval/drop warnings likewise fire once.
+enum Slot {
+    Failed,
+    Loaded {
+        program: Program,
+        warned_eval: bool,
+        warned_drops: bool,
+    },
+}
+
 /// The real engine: each script loads once per worker, errors cache so
-/// a broken program fails once instead of once per frame.
+/// a broken program fails once instead of once per frame. Cache key is
+/// `(src, with)` — two elements sharing a source but with different
+/// payloads get independent program state, so `setup` sees the right
+/// `d` in both.
 #[derive(Default)]
 pub struct SandboxPrograms {
     root: std::path::PathBuf,
-    programs: std::collections::HashMap<String, Option<Program>>,
+    programs: std::collections::HashMap<(String, String), Slot>,
 }
 
 impl SandboxPrograms {
@@ -163,22 +183,60 @@ impl SandboxPrograms {
             programs: std::collections::HashMap::new(),
         }
     }
+
+    /// Resolve `src` under `root`, refusing anything that escapes —
+    /// `..` segments, absolute paths, symlinks pointing outside.
+    /// Canonicalizing both sides makes the check lexical-proof.
+    fn resolve(&self, src: &str) -> Option<std::path::PathBuf> {
+        let root = self.root.canonicalize().ok()?;
+        let path = self.root.join(src).canonicalize().ok()?;
+        path.starts_with(&root).then_some(path)
+    }
 }
 
 impl ProgramSource for SandboxPrograms {
     fn ops(&mut self, src: &str, local_frame: u32, with: &str, w: f64, h: f64) -> Option<DrawList> {
-        let program = self.programs.entry(src.to_string()).or_insert_with(|| {
-            let path = self.root.join(src);
-            std::fs::read_to_string(&path)
-                .ok()
+        let key = (src.to_string(), with.to_string());
+        if !self.programs.contains_key(&key) {
+            let slot = self
+                .resolve(src)
+                .and_then(|path| std::fs::read_to_string(&path).ok())
                 .and_then(|s| Program::load(&s).ok())
-                .or_else(|| {
-                    eprintln!("warning: program `{src}` failed to load");
-                    None
+                .map(|program| Slot::Loaded {
+                    program,
+                    warned_eval: false,
+                    warned_drops: false,
                 })
-        });
-        program
-            .as_mut()
-            .and_then(|p| p.render(local_frame, with, w, h).ok())
+                .unwrap_or_else(|| {
+                    eprintln!("warning: program `{src}` failed to load");
+                    Slot::Failed
+                });
+            self.programs.insert(key.clone(), slot);
+        }
+        let slot = self.programs.get_mut(&key)?;
+        let Slot::Loaded {
+            program,
+            warned_eval,
+            warned_drops,
+        } = slot
+        else {
+            return None;
+        };
+        match program.render(local_frame, with, w, h) {
+            Ok((list, dropped)) => {
+                if dropped > 0 && !*warned_drops {
+                    *warned_drops = true;
+                    eprintln!("warning: program `{src}` dropped {dropped} malformed op(s)");
+                }
+                Some(list)
+            }
+            Err(e) => {
+                if !*warned_eval {
+                    *warned_eval = true;
+                    eprintln!("warning: program `{src}` render failed: {e}");
+                }
+                None
+            }
+        }
     }
 }

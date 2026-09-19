@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scene Engine — test UI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0e0e12; --panel: #17171d; --border: #2a2a34;
+    --text: #e6e6ec; --dim: #8a8a99; --accent: #4f8cff;
+    --err: #ff5566; --warn: #ffb84d; --ok: #3ddc84;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "SF Mono", Menlo, monospace;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .tag { color: var(--dim); font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 0; height: calc(100vh - 45px); }
+  section { padding: 12px 16px; overflow: auto; }
+  section + section { border-left: 1px solid var(--border); }
+  textarea {
+    width: 100%; height: calc(100% - 90px); resize: none;
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px; font: 12.5px/1.5 Menlo, monospace;
+    tab-size: 2;
+  }
+  textarea:focus { outline: 1px solid var(--accent); }
+  .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 7px 16px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: var(--border); color: var(--text); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #status { font-size: 12px; color: var(--dim); }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--ok); }
+  video { width: 100%; background: #000; border-radius: 6px; border: 1px solid var(--border); }
+  .diag {
+    padding: 6px 10px; margin: 4px 0; border-radius: 5px; font-size: 12px;
+    background: var(--panel); border-left: 3px solid var(--dim); cursor: pointer;
+  }
+  .diag.error { border-left-color: var(--err); }
+  .diag.warning { border-left-color: var(--warn); }
+  .diag .loc { color: var(--dim); margin-right: 8px; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 18px 0 6px; }
+  #assets { font-size: 12px; color: var(--dim); }
+  #assets span { display: inline-block; background: var(--panel); padding: 2px 8px; border-radius: 4px; margin: 2px 3px 2px 0; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  code { background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>scene engine</h1>
+  <span class="tag">localhost test ui</span>
+  <span class="tag" id="projdir"></span>
+</header>
+<main>
+  <section>
+    <textarea id="markup" spellcheck="false" placeholder="loading scene…"></textarea>
+    <div class="row">
+      <button id="check">Check</button>
+      <button id="render">Render</button>
+      <span id="status"></span>
+    </div>
+    <div class="hint">
+      markup saves to <code>main.scene</code> on render · timings load from
+      <code>timings.json</code> if present (<span id="timings">…</span>)
+    </div>
+  </section>
+  <section>
+    <video id="player" controls playsinline></video>
+    <h3>diagnostics</h3>
+    <div id="diags"><span class="hint">run Check or Render</span></div>
+    <h3>assets/</h3>
+    <div id="assets">…</div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function api(path, body) {
+  const res = await fetch(path, body
+    ? { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) }
+    : undefined);
+  return res.json();
+}
+
+function showDiags(list) {
+  const el = $('diags');
+  if (!list || !list.length) { el.innerHTML = '<span class="hint">clean — no diagnostics</span>'; return; }
+  el.innerHTML = list.map(d =>
+    `<div class="diag ${d.severity}"><span class="loc">${d.line || '?'}:${d.col || '?'}</span>${esc(d.message)}</div>`
+  ).join('');
+  el.scrollTop = 0;
+}
+
+function setStatus(text, cls) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = cls || '';
+}
+
+$('check').onclick = async () => {
+  setStatus('checking…');
+  const r = await api('/api/check', { markup: $('markup').value });
+  showDiags(r.diagnostics);
+  setStatus(r.ok ? 'check clean' : 'check failed — see diagnostics', r.ok ? 'ok' : 'err');
+};
+
+$('render').onclick = async () => {
+  setStatus('rendering… (this blocks until done)');
+  $('render').disabled = true;
+  try {
+    const r = await api('/api/render', { markup: $('markup').value });
+    showDiags(r.diagnostics);
+    if (r.ok) {
+      $('player').src = r.url + '?t=' + Date.now();
+      $('player').load();
+      setStatus(`rendered ${r.frames} frames`, 'ok');
+    } else {
+      setStatus('render failed: ' + (r.error || 'see diagnostics'), 'err');
+    }
+  } catch (e) {
+    setStatus('request failed: ' + e, 'err');
+  } finally {
+    $('render').disabled = false;
+  }
+};
+
+// jump to a diagnostic's line when clicked
+$('diags').addEventListener('click', ev => {
+  const loc = ev.target.closest('.diag')?.querySelector('.loc')?.textContent;
+  const line = parseInt(loc, 10);
+  if (!line) return;
+  const ta = $('markup');
+  const lines = ta.value.split('\n');
+  let pos = 0;
+  for (let i = 0; i < line - 1 && i < lines.length; i++) pos += lines[i].length + 1;
+  ta.focus();
+  ta.setSelectionRange(pos, pos + (lines[line - 1] || '').length);
+});
+
+(async function init() {
+  const [scene, assets, timings] = await Promise.all([
+    api('/api/scene'), api('/api/assets'), api('/api/timings'),
+  ]);
+  $('markup').value = scene.markup ||
+`<scene canvas="320x180" fps="30" clear="#101018">
+  <track kind="visual">
+    <board during="0s..3s" at="center" anim="rise">
+      <text>hello scene engine</text>
+    </board>
+  </track>
+  <render target="out/ui.mp4"/>
+</scene>
+`;
+  $('projdir').textContent = scene.path.replace(/\/main\.scene$/, '');
+  $('assets').innerHTML = assets.files.length
+    ? assets.files.map(f => `<span>${esc(f)}</span>`).join('')
+    : '<span class="hint">empty — drop media in assets/</span>';
+  $('timings').textContent = timings.present ? 'found' : 'not found';
+})();
+</script>
+</body>
+</html>
