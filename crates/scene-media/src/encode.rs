@@ -5,13 +5,14 @@
 //! BT.709-limited NV12, and these flags tell the encoder and the
 //! container that is what it is holding.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 use scene_ir::Rational;
 
 use crate::error::{MediaError, Tool};
+use crate::stderr::StderrDrain;
 
 /// One-way encode of an NV12 program stream to H.264/mp4.
 ///
@@ -20,6 +21,9 @@ use crate::error::{MediaError, Tool};
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
+    /// stderr drains on a thread so a chatty encoder can't fill the pipe
+    /// and deadlock against our stdin writes.
+    stderr: StderrDrain,
     finished: bool,
 }
 
@@ -62,7 +66,7 @@ impl Encoder {
         fps: &Rational,
         audio: Option<&Path>,
     ) -> Result<Self, MediaError> {
-        if w % 2 != 0 || h % 2 != 0 {
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(MediaError::ProbeParse(format!(
                 "NV12 needs even dimensions, got {w}x{h}"
             )));
@@ -79,9 +83,11 @@ impl Encoder {
                 source: e,
             })?;
         let stdin = child.stdin.take().expect("stdin was piped");
+        let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
         Ok(Encoder {
             child,
             stdin: Some(stdin),
+            stderr,
             finished: false,
         })
     }
@@ -138,11 +144,8 @@ impl Encoder {
     }
 
     fn stderr_tail(&mut self) -> String {
-        let mut buf = String::new();
-        if let Some(mut err) = self.child.stderr.take() {
-            let _ = err.read_to_string(&mut buf);
-        }
-        buf.trim().to_string()
+        self.stderr.join();
+        self.stderr.tail()
     }
 }
 
@@ -287,9 +290,12 @@ mod tests {
     fn write_after_finish_is_an_error_not_a_panic() {
         // Can't open a real encoder without ffmpeg; exercise the closed
         // stdin path on a value constructed by hand.
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer); // EOF — the drain thread exits, so Drop::join returns
         let mut enc = Encoder {
             child: Command::new("true").spawn().unwrap(),
             stdin: None,
+            stderr: StderrDrain::start(reader),
             finished: false, // Drop waits on the child — no zombie
         };
         assert!(enc.write_frame(&[0]).is_err());

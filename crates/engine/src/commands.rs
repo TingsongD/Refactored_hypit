@@ -46,6 +46,21 @@ fn has_error_diagnostics(source: &str) -> bool {
     compile(source).diagnostics.iter().any(|d| d.is_error())
 }
 
+/// File-existence warnings for a scene's asset refs — a CLI/UI concern
+/// (needs fs access), so the IR itself stays pure. Shared by `check` and
+/// `/api/check` so both produce the same diagnostics.
+pub fn asset_warnings(scene: &scene_ir::Scene, base: &Path) -> Vec<Diagnostic> {
+    scene
+        .asset_refs()
+        .into_iter()
+        .filter(|(src, _)| !src.contains("://"))
+        .filter(|(src, _)| !base.join(src).exists())
+        .map(|(src, span)| {
+            Diagnostic::warning(format!("referenced file not found: {src}"), Some(span))
+        })
+        .collect()
+}
+
 pub fn check(file: &Path) -> i32 {
     let (name, source) = match read_source(file) {
         Ok(v) => v,
@@ -60,18 +75,10 @@ pub fn check(file: &Path) -> i32 {
     // File-existence warnings are a CLI concern (they need fs access);
     // the IR itself stays pure.
     if let Some(scene) = &outcome.scene {
-        let base = file.parent().unwrap_or(Path::new("."));
-        for (src, span) in scene.asset_refs() {
-            if src.contains("://") {
-                continue;
-            }
-            if !base.join(src).exists() {
-                diagnostics.push(Diagnostic::warning(
-                    format!("referenced file not found: {src}"),
-                    Some(span),
-                ));
-            }
-        }
+        diagnostics.extend(asset_warnings(
+            scene,
+            file.parent().unwrap_or(Path::new(".")),
+        ));
     }
 
     report::emit(&name, &source, &diagnostics);
@@ -290,6 +297,15 @@ pub struct RenderError {
     pub bundles: Vec<DiagBundle>,
 }
 
+/// Removes its file on drop — a program.wav left behind by a failed
+/// render (mix error, encode error, even a partial mix) is just litter.
+struct TempWav(PathBuf);
+impl Drop for TempWav {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// The render pipeline with reporting abstracted: diagnostics and
 /// failures come back as data instead of prints, so the CLI can print
 /// them and the UI can ship them as JSON.
@@ -407,10 +423,11 @@ pub fn render_inner(
         None
     } else {
         let wav = target.with_extension("program.wav");
-        if let Err(e) = mix_program(&graph, &wav) {
+        let guard = TempWav(wav);
+        if let Err(e) = mix_program(&graph, &guard.0) {
             return Err(stage(format!("audio mix failed: {e}"), bundles));
         }
-        Some(wav)
+        Some(guard)
     };
 
     let mut encoder = match Encoder::open_muxed_opt(
@@ -418,17 +435,23 @@ pub fn render_inner(
         resolved.canvas.width,
         resolved.canvas.height,
         &resolved.frame_rate,
-        program_wav.as_deref(),
+        program_wav.as_ref().map(|t| t.0.as_path()),
     ) {
         Ok(e) => e,
         Err(e) => return Err(stage(e.to_string(), bundles)),
     };
     let make = renderer_factory(project_root.clone());
 
-    let rendered = render_frames(&resolved, &timings, range, workers.max(1), &make);
+    let rendered = match render_frames(&resolved, &timings, range, workers.max(1), &make) {
+        Ok(r) => r,
+        Err(e) => return Err(stage(format!("render worker failed: {e}"), bundles)),
+    };
     let (w, h) = (resolved.canvas.width, resolved.canvas.height);
     for frame in &rendered {
         if let Err(e) = encoder.write_frame(&rgba_to_nv12(&frame.pixels, w, h)) {
+            // The encoder opened with -y: the target is already truncated
+            // — remove the corpse so nothing serves a partial video.
+            let _ = fs::remove_file(&target);
             return Err(stage(
                 format!("encode failed at frame {}: {e}", frame.index),
                 bundles,
@@ -436,10 +459,8 @@ pub fn render_inner(
         }
     }
     if let Err(e) = encoder.finish() {
+        let _ = fs::remove_file(&target);
         return Err(stage(e.to_string(), bundles));
-    }
-    if let Some(wav) = &program_wav {
-        let _ = fs::remove_file(wav);
     }
     Ok(RenderReport {
         frames: rendered.len(),
@@ -480,9 +501,14 @@ pub fn render(
 }
 
 fn parse_frame_range(spec: &str) -> Option<std::ops::Range<u32>> {
-    let (start, end) = spec.split_once(':')?;
-    let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
-    (end > start).then_some(start..end)
+    // `N` alone is the single frame N; `n:m` is the half-open range.
+    if let Some((start, end)) = spec.split_once(':') {
+        let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
+        (end > start).then_some(start..end)
+    } else {
+        let n = spec.trim().parse().ok()?;
+        Some(n..n + 1)
+    }
 }
 
 /// Pins the factory signature so `scene` and `timings` share the lifetime
@@ -621,6 +647,21 @@ pub fn doctor() -> i32 {
     0
 }
 
+/// The src written into the draft scene: already-relative paths stay
+/// (the draft resolves assets against the scene's own directory);
+/// absolute paths shrink to relative when they sit under the cwd.
+fn adapt_src(path: &Path) -> String {
+    if path.is_relative() {
+        return path.to_string_lossy().into_owned();
+    }
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// `engine adapt <source>` — ingest, analyze, emit a draft .scene.
 pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
     let ingested = match scene_adapt::ingest(source, out_dir) {
@@ -637,14 +678,7 @@ pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
             return 1;
         }
     };
-    // The src written into the scene: relative when the file sits inside
-    // out_dir, absolute otherwise.
-    let src = ingested
-        .path
-        .strip_prefix(out_dir)
-        .ok()
-        .and_then(|p| out_dir.join(p).to_str().map(String::from))
-        .unwrap_or_else(|| ingested.path.to_string_lossy().into_owned());
+    let src = adapt_src(&ingested.path);
     let markup = scene_adapt::emit_scene(&src, &analysis);
 
     eprintln!(
@@ -675,5 +709,46 @@ pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
             print!("{markup}");
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_accepts_range_and_single() {
+        assert_eq!(parse_frame_range("0:60"), Some(0..60));
+        assert_eq!(parse_frame_range("5"), Some(5..6));
+        assert_eq!(parse_frame_range(" 10 "), Some(10..11));
+        assert_eq!(parse_frame_range("5:5"), None); // empty range still rejected
+        assert_eq!(parse_frame_range("9:5"), None);
+        assert_eq!(parse_frame_range("x"), None);
+        assert_eq!(parse_frame_range("1:x"), None);
+    }
+
+    #[test]
+    fn temp_wav_removes_its_file_on_drop() {
+        let path = std::env::temp_dir().join(format!("tempwav-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        {
+            let _guard = TempWav(path.clone());
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn adapt_src_prefers_relative() {
+        // Relative paths pass through unchanged.
+        assert_eq!(adapt_src(Path::new("assets/v.mp4")), "assets/v.mp4");
+        // Absolute paths under the cwd shrink to relative.
+        let under = std::env::current_dir()
+            .unwrap()
+            .join("assets")
+            .join("v.mp4");
+        assert_eq!(adapt_src(&under), "assets/v.mp4");
+        // Outside the cwd stays absolute.
+        let outside = Path::new("/definitely/not/here.mp4");
+        assert_eq!(adapt_src(outside), "/definitely/not/here.mp4");
     }
 }

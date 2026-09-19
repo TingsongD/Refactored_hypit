@@ -117,7 +117,9 @@ fn handle(mut stream: TcpStream, dir: &Path) {
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&res.body);
+    if req.method != "HEAD" {
+        let _ = stream.write_all(&res.body);
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
@@ -182,13 +184,16 @@ fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
-        {
-            out.push(v);
-            i += 3;
-            continue;
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            // Hex digits are ASCII — parse from bytes, never slice `s`:
+            // `&s[i+1..i+3]` panics on a `%` before a multibyte char.
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
         }
         out.push(bytes[i]);
         i += 1;
@@ -201,19 +206,21 @@ fn url_decode(s: &str) -> String {
 fn route(req: &Request, dir: &Path) -> Response {
     let path = req.path.split('?').next().unwrap_or("/");
     match (req.method.as_str(), path) {
-        ("GET", "/") => Response::new(200, "text/html; charset=utf-8", PAGE.as_bytes().to_vec()),
+        ("GET" | "HEAD", "/") => {
+            Response::new(200, "text/html; charset=utf-8", PAGE.as_bytes().to_vec())
+        }
         ("GET", "/api/scene") => Response::json(api_scene(dir)),
         ("GET", "/api/assets") => Response::json(api_assets(dir)),
         ("GET", "/api/timings") => Response::json(serde_json::json!({
             "present": dir.join("timings.json").is_file()
         })),
         ("POST", "/api/check") => {
-            post_guard(req).unwrap_or_else(|| Response::json(api_check(&req.body)))
+            post_guard(req).unwrap_or_else(|| Response::json(api_check(dir, &req.body)))
         }
         ("POST", "/api/render") => {
             post_guard(req).unwrap_or_else(|| Response::json(api_render(dir, &req.body)))
         }
-        ("GET", p) if p.starts_with("/out/") => serve_file(dir, p, req),
+        ("GET" | "HEAD", p) if p.starts_with("/out/") => serve_file(dir, p, req),
         _ => Response::new(404, "text/plain", b"not found".to_vec()),
     }
 }
@@ -230,39 +237,64 @@ fn post_guard(req: &Request) -> Option<Response> {
 }
 
 /// Serve `<dir>/out/<name>` with byte-range support (video scrubbing).
-/// Path is confined: no `..`, no separators, must stay under `out/`.
+/// Confined twice: the name can't contain `..`/separators, and the
+/// canonicalized file must stay under canonicalized `out/` (symlinks
+/// pointing outside get a 404). Reads only the requested range — a
+/// scrubbing `<video>` shouldn't pull the whole file per seek.
 fn serve_file(dir: &Path, path: &str, req: &Request) -> Response {
     let name = url_decode(path.trim_start_matches("/out/"));
     if name.is_empty() || name.contains("..") || name.contains('/') || name.contains('\\') {
         return Response::new(403, "text/plain", b"forbidden".to_vec());
     }
-    let file = dir.join("out").join(&name);
-    let data = match std::fs::read(&file) {
-        Ok(d) => d,
-        Err(_) => return Response::new(404, "text/plain", b"not found".to_vec()),
+    let out_root = dir.join("out").canonicalize();
+    let file = dir.join("out").join(&name).canonicalize();
+    let file = match (out_root, file) {
+        (Ok(root), Ok(f)) if f.starts_with(&root) && f.is_file() => f,
+        _ => return Response::new(404, "text/plain", b"not found".to_vec()),
     };
-    let total = data.len();
+    let total = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+
+    // Malformed/unsatisfiable ranges fall back to a full 200 rather
+    // than risking a bad slice — the client just ignores it.
     let range = req
         .headers
         .iter()
         .find(|(k, _)| k == "range")
         .and_then(|(_, v)| parse_range(v, total));
-    match range {
-        Some((start, end)) => {
-            let end = end.min(total); // exclusive
-            let mut res = Response::new(206, "video/mp4", data[start..end].to_vec());
-            res.extra_headers
-                .push(format!("Content-Range: bytes {start}-{}/{total}", end - 1));
-            res.extra_headers.push("Accept-Ranges: bytes".to_string());
-            res
-        }
-        // Malformed/unsatisfiable ranges fall back to a full 200 rather
-        // than risking a bad slice — the client just ignores it.
-        None => {
-            let mut res = Response::new(200, "video/mp4", data);
-            res.extra_headers.push("Accept-Ranges: bytes".to_string());
-            res
-        }
+    let (status, start, end) = match range {
+        Some((s, e)) => (206, s, e.min(total)),
+        None => (200, 0, total),
+    };
+    let mut body = Vec::new();
+    let served = (|| -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let mut f = std::fs::File::open(&file)?;
+        f.seek(SeekFrom::Start(start as u64))?;
+        f.take((end - start) as u64).read_to_end(&mut body)?;
+        Ok(())
+    })()
+    .is_ok();
+    if !served {
+        return Response::new(404, "text/plain", b"not found".to_vec());
+    }
+    let mut res = Response::new(status, content_type(&name), body);
+    res.extra_headers.push("Accept-Ranges: bytes".to_string());
+    if status == 206 {
+        res.extra_headers
+            .push(format!("Content-Range: bytes {start}-{}/{total}", end - 1));
+    }
+    res
+}
+
+fn content_type(name: &str) -> &'static str {
+    match name.rsplit('.').next() {
+        Some("mp4" | "m4v" | "mov") => "video/mp4",
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
     }
 }
 
@@ -357,7 +389,7 @@ fn req_markup(body: &[u8]) -> Option<String> {
         .map(String::from)
 }
 
-fn api_check(body: &[u8]) -> serde_json::Value {
+fn api_check(dir: &Path, body: &[u8]) -> serde_json::Value {
     let Some(markup) = req_markup(body) else {
         return serde_json::json!({ "ok": false, "error": "bad request json" });
     };
@@ -370,7 +402,12 @@ fn api_check(body: &[u8]) -> serde_json::Value {
             });
         }
     };
-    let (_scene, diags) = scene_markup::lower(&doc);
+    let (scene, mut diags) = scene_markup::lower(&doc);
+    // Same file-existence warnings `engine check` adds — the UI mustn't
+    // say "clean" where the CLI warns.
+    if let Some(scene) = &scene {
+        diags.extend(commands::asset_warnings(scene, dir));
+    }
     serde_json::json!({
         "ok": !scene_ir::has_errors(&diags),
         "diagnostics": diags.iter().map(|d| diag_json(&markup, d)).collect::<Vec<_>>(),
@@ -414,6 +451,7 @@ fn api_render(dir: &Path, body: &[u8]) -> serde_json::Value {
             "ok": true,
             "saved": true,
             "frames": report.frames,
+            "timings": timings.is_some(),
             "url": "/out/ui.mp4",
             "diagnostics": bundle_json(&report.bundles),
         }),
@@ -517,10 +555,11 @@ mod tests {
 
     #[test]
     fn check_reports_error_positions() {
+        let dir = std::env::temp_dir();
         let body = serde_json::json!({
             "markup": "<scene canvas=\"64x64\" fps=\"30\">\n<track><bogus/></track>\n</scene>"
         });
-        let res = api_check(body.to_string().as_bytes());
+        let res = api_check(&dir, body.to_string().as_bytes());
         assert_eq!(res["ok"], false);
         let diags = res["diagnostics"].as_array().unwrap();
         assert!(!diags.is_empty());
@@ -529,11 +568,31 @@ mod tests {
 
     #[test]
     fn check_clean_markup_is_ok() {
+        let dir = std::env::temp_dir();
         let body = serde_json::json!({
             "markup": "<scene canvas=\"64x64\" fps=\"30\"><track kind=\"visual\"><text during=\"0s..1s\">x</text></track></scene>"
         });
-        let res = api_check(body.to_string().as_bytes());
+        let res = api_check(&dir, body.to_string().as_bytes());
         assert_eq!(res["ok"], true);
+    }
+
+    #[test]
+    fn check_warns_on_missing_assets_like_the_cli() {
+        let dir = std::env::temp_dir().join(format!("ui-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = serde_json::json!({
+            "markup": "<scene canvas=\"64x64\" fps=\"30\"><track kind=\"visual\"><clip src=\"assets/nope.mp4\" during=\"0s..1s\"/></track></scene>"
+        });
+        let res = api_check(&dir, body.to_string().as_bytes());
+        assert_eq!(res["ok"], true); // warning, not error
+        let diags = res["diagnostics"].as_array().unwrap();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d["message"].as_str().unwrap().contains("nope.mp4")),
+            "missing-asset warning should reach the UI: {diags:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -558,5 +617,55 @@ mod tests {
         assert_eq!(res2["saved"], false);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), good);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn url_decode_never_panics_on_multibyte_after_percent() {
+        // `%` followed by a multibyte char used to panic on a `&str`
+        // slice at a non-char-boundary — one crafted URL killed the UI.
+        assert_eq!(url_decode("%€x"), "%€x");
+        assert_eq!(url_decode("/out/%日本語.mp4"), "/out/%日本語.mp4");
+        assert_eq!(url_decode("%e2%82%ac"), "€"); // valid escapes still decode
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_out_is_not_served() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("ui-sym-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let secret = dir.join("secret.txt");
+        std::fs::write(&secret, b"top secret").unwrap();
+        symlink(&secret, dir.join("out").join("leak.mp4")).unwrap();
+        let r = req("GET", "/out/leak.mp4", &[], &[]);
+        let res = serve_file(&dir, r.path.as_str(), &r);
+        assert!(
+            res.status == 403 || res.status == 404,
+            "symlink outside out/ must not be served: {}",
+            res.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn head_returns_headers_without_body() {
+        let dir = std::env::temp_dir().join(format!("ui-head-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("out").join("v.mp4"), b"0123456789").unwrap();
+        let r = req("HEAD", "/out/v.mp4", &[], &[]);
+        let res = route(&r, &dir);
+        assert_eq!(res.status, 200);
+        // Body computed for Content-Length correctness; `handle` skips
+        // sending it for HEAD — that's the wire contract.
+        assert_eq!(res.body.len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_type_follows_extension() {
+        assert_eq!(content_type("a.mp4"), "video/mp4");
+        assert_eq!(content_type("b.wav"), "audio/wav");
+        assert_eq!(content_type("c.png"), "image/png");
+        assert_eq!(content_type("d.bin"), "application/octet-stream");
     }
 }

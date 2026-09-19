@@ -47,16 +47,18 @@ var ctx = {
   circle(x, y, r) { __ops.push({op:'circle', x, y, r, c: this.fill}); },
   text(t, x, y) { __ops.push({op:'text', t, x, y, size: this.size, c: this.fill}); },
 };
-function __run(frame, dataJson, w, h) {
-  __ops.length = 0;
-  ctx.w = w; ctx.h = h;
+// Setup and render are separate evals on the Rust side — each gets its
+// own instruction budget, so heavy init can't borrow the first frame's.
+function __setup(dataJson) {
   // `with` parses once at setup — `d` is the same object every frame, so
   // state stashed on it in setup() reaches render() as documented.
-  if (!__setup_done) {
-    __data = JSON.parse(dataJson);
-    if (typeof setup === 'function') { setup(__data); }
-    __setup_done = true;
-  }
+  __data = JSON.parse(dataJson);
+  if (typeof setup === 'function') { setup(__data); }
+  __setup_done = true;
+}
+function __render(frame, w, h) {
+  __ops.length = 0;
+  ctx.w = w; ctx.h = h;
   if (typeof render !== 'function') { throw new Error('program must define render(ctx, frame, data)'); }
   render(ctx, frame, __data);
   return JSON.stringify(__ops);
@@ -108,19 +110,31 @@ impl Program {
         w: f64,
         h: f64,
     ) -> Result<(DrawList, usize), ScriptError> {
-        self.budget.set(INSTRUCTION_BUDGET);
         let data = if data_json.is_empty() {
             "{}"
         } else {
             data_json
         };
+        // Every eval gets its own budget: the status probe is trivial,
+        // setup's init work gets a full allotment, and each frame's
+        // render gets a fresh one too.
+        self.budget.set(INSTRUCTION_BUDGET);
+        let needs_setup = self
+            .ctx
+            .with(|ctx| ctx.eval::<bool, _>("!__setup_done"))
+            .map_err(|e| ScriptError::Eval(e.to_string()))?;
+        if needs_setup {
+            self.budget.set(INSTRUCTION_BUDGET);
+            self.ctx
+                .with(|ctx| ctx.eval::<(), _>(format!("__setup({})", js_str(data))))
+                .map_err(|e| ScriptError::Eval(e.to_string()))?;
+        }
+        self.budget.set(INSTRUCTION_BUDGET);
         // The data rides in as a quoted JS *string* — it's JSON.parse'd
-        // inside __run, never evaluated as code.
+        // inside __setup, never evaluated as code.
         let json = self
             .ctx
-            .with(|ctx| {
-                ctx.eval::<String, _>(format!("__run({frame}, {}, {w}, {h})", js_str(data)))
-            })
+            .with(|ctx| ctx.eval::<String, _>(format!("__render({frame}, {w}, {h})")))
             .map_err(|e| ScriptError::Eval(e.to_string()))?;
         Ok(DrawList::from_json(&json))
     }
@@ -176,6 +190,29 @@ pub struct SandboxPrograms {
     programs: std::collections::HashMap<(String, String), Slot>,
 }
 
+/// Why a `src` couldn't be used — "escapes the root" and "isn't there"
+/// deserve different warnings.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResolveError {
+    /// `..` segments, an absolute path, or a symlink pointing outside.
+    Escapes,
+    /// Doesn't exist (or the root itself can't be resolved).
+    Missing,
+}
+
+/// Canonicalize `with` for the cache key: formatting and key-order
+/// variants of the same payload share one program — serde_json maps
+/// sort keys, so `{"a":1}` vs `{"a": 1}` and `{"a":1,"b":2}` vs
+/// `{"b":2,"a":1}` all collapse. Invalid/non-object JSON falls back to
+/// the raw string — the markup layer already rejects those anyway.
+fn canonical_with(with: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(with)
+        .ok()
+        .filter(|v| v.is_object())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| with.to_string())
+}
+
 impl SandboxPrograms {
     pub fn new(root: std::path::PathBuf) -> Self {
         SandboxPrograms {
@@ -187,30 +224,50 @@ impl SandboxPrograms {
     /// Resolve `src` under `root`, refusing anything that escapes —
     /// `..` segments, absolute paths, symlinks pointing outside.
     /// Canonicalizing both sides makes the check lexical-proof.
-    fn resolve(&self, src: &str) -> Option<std::path::PathBuf> {
-        let root = self.root.canonicalize().ok()?;
-        let path = self.root.join(src).canonicalize().ok()?;
-        path.starts_with(&root).then_some(path)
+    pub(crate) fn resolve(&self, src: &str) -> Result<std::path::PathBuf, ResolveError> {
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|_| ResolveError::Missing)?;
+        let path = self
+            .root
+            .join(src)
+            .canonicalize()
+            .map_err(|_| ResolveError::Missing)?;
+        if path.starts_with(&root) {
+            Ok(path)
+        } else {
+            Err(ResolveError::Escapes)
+        }
     }
 }
 
 impl ProgramSource for SandboxPrograms {
     fn ops(&mut self, src: &str, local_frame: u32, with: &str, w: f64, h: f64) -> Option<DrawList> {
-        let key = (src.to_string(), with.to_string());
+        let key = (src.to_string(), canonical_with(with));
         if !self.programs.contains_key(&key) {
-            let slot = self
-                .resolve(src)
-                .and_then(|path| std::fs::read_to_string(&path).ok())
-                .and_then(|s| Program::load(&s).ok())
-                .map(|program| Slot::Loaded {
-                    program,
-                    warned_eval: false,
-                    warned_drops: false,
-                })
-                .unwrap_or_else(|| {
-                    eprintln!("warning: program `{src}` failed to load");
+            let slot = match self.resolve(src) {
+                Err(ResolveError::Escapes) => {
+                    eprintln!("warning: program `{src}` escapes the project root — refused");
                     Slot::Failed
-                });
+                }
+                Err(ResolveError::Missing) => {
+                    eprintln!("warning: program `{src}` not found");
+                    Slot::Failed
+                }
+                Ok(path) => std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| Program::load(&s).ok())
+                    .map(|program| Slot::Loaded {
+                        program,
+                        warned_eval: false,
+                        warned_drops: false,
+                    })
+                    .unwrap_or_else(|| {
+                        eprintln!("warning: program `{src}` failed to load");
+                        Slot::Failed
+                    }),
+            };
             self.programs.insert(key.clone(), slot);
         }
         let slot = self.programs.get_mut(&key)?;
@@ -238,5 +295,101 @@ impl ProgramSource for SandboxPrograms {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DrawOp;
+
+    #[test]
+    fn setup_runs_under_its_own_budget() {
+        // Setup burns ~200 ticks (measured: ~1 tick per 5k iterations).
+        // If setup shared the render eval's budget, `budget` would show
+        // ≤ 20000-200 afterward; a fresh per-eval budget leaves ~19995+.
+        let mut p = Program::load(
+            "function setup(d){ for(let i=0;i<1_000_000;i++){} d.flag=7; }\n\
+             function render(ctx,f,d){ ctx.rect(d.flag,0,1,1); }",
+        )
+        .unwrap();
+        let (ops, _) = p.render(0, "{}", 1.0, 1.0).unwrap();
+        assert_eq!(ops.0.len(), 1, "setup ran and render produced ops");
+        assert!(
+            p.budget.get() > INSTRUCTION_BUDGET - 100,
+            "render eval ran under a fresh budget — setup's ticks not counted: left={}",
+            p.budget.get()
+        );
+    }
+
+    #[test]
+    fn setup_failure_surfaces_as_eval_error() {
+        let mut p =
+            Program::load("function setup(d){ nope(); } function render(ctx,f,d){}").unwrap();
+        assert!(p.render(0, "{}", 1.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn resolve_tells_escapes_from_missing() {
+        let id = std::process::id();
+        let root = std::env::temp_dir().join(format!("resolve-root-{id}"));
+        let outside = std::env::temp_dir().join(format!("resolve-out-{id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("ok.js"), "function render(){}").unwrap();
+        std::fs::write(outside.join("x.js"), "function render(){}").unwrap();
+
+        let p = SandboxPrograms::new(root.clone());
+        assert!(p.resolve("ok.js").is_ok());
+        // A real file reached through `..` is an escape…
+        let rel = format!("../resolve-out-{id}/x.js");
+        assert_eq!(p.resolve(&rel), Err(ResolveError::Escapes));
+        // …and so is an absolute path outside the root.
+        assert_eq!(
+            p.resolve(outside.join("x.js").to_str().unwrap()),
+            Err(ResolveError::Escapes)
+        );
+        // …while something that simply isn't there is missing.
+        assert_eq!(p.resolve("missing.js"), Err(ResolveError::Missing));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn canonical_with_folds_formatting() {
+        assert_eq!(canonical_with(r#"{"a":1}"#), canonical_with(r#"{"a": 1}"#));
+        // serde_json maps sort keys — key order folds too.
+        assert_eq!(
+            canonical_with(r#"{"a":1,"b":2}"#),
+            canonical_with(r#"{"b":2,"a":1}"#)
+        );
+        assert_ne!(canonical_with(r#"{"a":1}"#), canonical_with(r#"{"a":2}"#));
+        assert_eq!(canonical_with("not json"), "not json");
+    }
+
+    #[test]
+    fn whitespace_variant_with_shares_one_program() {
+        // `{"step":1}` and `{"step": 1}` are the same payload — they must
+        // share one program, so `d` state persists across the variant.
+        let root = std::env::temp_dir().join(format!("prog-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("p.js"),
+            "function setup(d){ d.x = d.step; }\n\
+             function render(ctx,f,d){ d.x += d.step; ctx.rect(d.x,0,1,1); }",
+        )
+        .unwrap();
+        let mut progs = SandboxPrograms::new(root.clone());
+        let x = |list: DrawList| match &list.0[0] {
+            DrawOp::Rect { x, .. } => *x,
+            _ => panic!("rect"),
+        };
+        let a = progs.ops("p.js", 0, r#"{"step":1}"#, 1.0, 1.0).unwrap();
+        assert_eq!(x(a), 2.0); // setup 1 + render 1
+        // Whitespace variant hits the same slot — `d.x` continues at 3,
+        // not reset to 2 by a fresh program.
+        let b = progs.ops("p.js", 1, r#"{"step": 1}"#, 1.0, 1.0).unwrap();
+        assert_eq!(x(b), 3.0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

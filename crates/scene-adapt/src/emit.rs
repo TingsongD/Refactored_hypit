@@ -43,9 +43,14 @@ pub fn emit_scene(src: &str, a: &Analysis) -> String {
     ));
 
     // One board per detected shot boundary — placeholders an author
-    // replaces with real captions or cards.
+    // replaces with real captions or cards. Analysis may hand back
+    // unsorted, duplicated, or out-of-range cuts — normalize or boards
+    // silently drop below.
     let mut bounds: Vec<f64> = a.cuts.clone();
     bounds.push(dur);
+    bounds.retain(|&b| b.is_finite() && b > 0.0 && b <= dur);
+    bounds.sort_by(f64::total_cmp);
+    bounds.dedup();
     let mut start = 0.0;
     for (i, &end) in bounds.iter().enumerate() {
         if end - start < 0.05 {

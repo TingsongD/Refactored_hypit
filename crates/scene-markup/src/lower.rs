@@ -472,28 +472,25 @@ impl Lower {
         known_cues.sort_unstable();
 
         for track in tracks {
-            if let Some(aref) = &track.anchor {
-                if !valid_source(&aref.source) {
-                    self.error(
-                        track.span,
-                        format!("unknown timing source `{}`", aref.source),
-                    );
-                }
+            if let Some(aref) = &track.anchor
+                && !valid_source(&aref.source)
+            {
+                self.error(
+                    track.span,
+                    format!("unknown timing source `{}`", aref.source),
+                );
             }
             let mut stack: Vec<&Element> = track.elements.iter().collect();
             while let Some(element) = stack.pop() {
                 if let Some(timing) = &element.timing {
                     for anchor in [&timing.start, &timing.end] {
-                        if let Anchor::Cue { cue, .. } = anchor {
-                            if !cue_ids.contains(cue) {
-                                self.error(
-                                    element.span,
-                                    format!(
-                                        "unknown cue `{cue}` (known: {})",
-                                        known_cues.join(", ")
-                                    ),
-                                );
-                            }
+                        if let Anchor::Cue { cue, .. } = anchor
+                            && !cue_ids.contains(cue)
+                        {
+                            self.error(
+                                element.span,
+                                format!("unknown cue `{cue}` (known: {})", known_cues.join(", ")),
+                            );
                         }
                     }
                 }

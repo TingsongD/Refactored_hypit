@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use scene_media::{Frame, FrameStream, MediaError};
+use scene_media::{Frame, FrameStream, MediaError, probe};
 
 /// Pixels for one authored asset at one program instant.
 pub trait FrameSource {
@@ -31,9 +31,16 @@ struct SeqStream {
     stream: FrameStream,
     /// Rate ratio: source frames per program frame.
     ratio: f64,
+    /// Source-frame index the decode started at — nonzero after a `-ss`
+    /// seek, since ffmpeg numbers piped frames from 0 again.
+    base: u64,
     /// The latest decoded frame and its source index.
     current: Option<Frame>,
 }
+
+/// Prefix length past which an initial `-ss` seek beats decoding and
+/// discarding. ~2s at typical rates — trivial prefixes just decode.
+const SEEK_THRESHOLD: u64 = 60;
 
 impl SeqFrameSource {
     /// `root` is the project directory `src` paths resolve against.
@@ -44,22 +51,39 @@ impl SeqFrameSource {
         }
     }
 
-    fn open(&mut self, src: &str) -> Option<&mut SeqStream> {
+    /// Open (lazily) the stream for `src`. `frame`/`program_fps` matter
+    /// only on first open: a first request deep into the stream opens
+    /// with `-ss` instead of decoding the whole prefix — each pool
+    /// worker otherwise re-decodes frames 0..shard_start for every clip.
+    fn open(&mut self, src: &str, frame: u64, program_fps: f64) -> Option<&mut SeqStream> {
         if !self.streams.contains_key(src) {
             let path = self.root.join(src);
-            let opened = FrameStream::open(&path).ok().map(|stream| {
-                let source_fps = stream
-                    .info()
-                    .video
-                    .as_ref()
-                    .and_then(|v| v.frame_rate)
-                    .map(|r| r.to_f64())
-                    .unwrap_or(30.0);
-                SeqStream {
-                    stream,
-                    ratio: source_fps,
-                    current: None,
-                }
+            let info = probe(&path).ok()?;
+            let source_fps = info
+                .video
+                .as_ref()
+                .and_then(|v| v.frame_rate)
+                .map(|r| r.to_f64())
+                .unwrap_or(30.0);
+            let target = ((frame as f64) * source_fps / program_fps).floor() as u64;
+            // Seek to half a frame before the target: ffmpeg's accurate
+            // seek then delivers `target` as the first decoded frame
+            // (exact on CFR sources; ±1 on VFR). Decoded indices restart
+            // at 0, so `base` carries the source offset.
+            let (base, stream) = if target >= SEEK_THRESHOLD {
+                let secs = format!("{:.6}", (target as f64 - 0.5) / source_fps);
+                (
+                    target,
+                    FrameStream::open_with(&path, &info, &["-ss", &secs]),
+                )
+            } else {
+                (0, FrameStream::open_with(&path, &info, &[]))
+            };
+            let opened = stream.ok().map(|stream| SeqStream {
+                stream,
+                ratio: source_fps,
+                base,
+                current: None,
             });
             self.streams.insert(src.to_string(), opened);
         }
@@ -69,14 +93,17 @@ impl SeqFrameSource {
 
 impl FrameSource for SeqFrameSource {
     fn sample(&mut self, src: &str, frame: u64, fps: f64) -> Option<Frame> {
-        let seq = self.open(src)?;
+        let seq = self.open(src, frame, fps)?;
         let target = ((frame as f64) * seq.ratio / fps).floor() as u64;
         // Advance the decode until the current frame covers `target`.
         loop {
             match &seq.current {
                 Some(f) if f.index >= target => return Some(f.clone()),
                 _ => match seq.stream.next() {
-                    Some(Ok(f)) => seq.current = Some(f),
+                    Some(Ok(mut f)) => {
+                        f.index += seq.base;
+                        seq.current = Some(f);
+                    }
                     _ => return seq.current.clone(),
                 },
             }

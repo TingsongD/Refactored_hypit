@@ -125,7 +125,7 @@ $('render').onclick = async () => {
     if (r.ok) {
       $('player').src = r.url + '?t=' + Date.now();
       $('player').load();
-      setStatus(`rendered ${r.frames} frames`, 'ok');
+      setStatus(`rendered ${r.frames} frames` + (r.timings ? ' · timings.json applied' : ''), 'ok');
     } else {
       setStatus('render failed: ' + (r.error || 'see diagnostics'), 'err');
     }

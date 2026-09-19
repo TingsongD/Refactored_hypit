@@ -181,6 +181,23 @@ mod tests {
         assert!(emit_scene("v.mp4", &a).contains("fps=\"30\""));
     }
 
+    #[test]
+    fn unsorted_and_out_of_range_cuts_are_normalized() {
+        // Analysis contract violations must not silently drop boards.
+        let a = analysis(&[7.0, 2.0, 2.0, -1.0, 9.0, 12.0, f64::NAN], true);
+        let (scene, errors) = lower_emitted(&emit_scene("v.mp4", &a));
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        let scene = scene.unwrap();
+        // clip + boards for shots [0..2], [2..7], [7..9] — the -1/9/12/NaN
+        // cuts normalize away (9 == dur duplicates the pushed boundary).
+        let boards = scene.tracks[0]
+            .elements
+            .iter()
+            .filter(|e| matches!(e.kind, scene_ir::ElementKind::Board))
+            .count();
+        assert_eq!(boards, 3);
+    }
+
     // --- gated: real ffmpeg ------------------------------------------------
 
     fn gated() -> bool {

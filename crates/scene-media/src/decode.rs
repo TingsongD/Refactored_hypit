@@ -8,6 +8,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 
 use crate::error::{MediaError, Tool};
 use crate::probe::{MediaInfo, probe};
+use crate::stderr::StderrDrain;
 
 /// One decoded frame, RGBA8, row-major, tightly packed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,9 @@ impl Frame {
 pub struct FrameStream {
     child: Child,
     stdout: ChildStdout,
+    /// stderr drains on a thread so a chatty decoder can't fill the pipe
+    /// and deadlock against our stdout reads.
+    stderr: StderrDrain,
     info: MediaInfo,
     width: u32,
     height: u32,
@@ -111,9 +115,11 @@ impl FrameStream {
             source: e,
         })?;
         let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
         Ok(FrameStream {
             child,
             stdout,
+            stderr,
             info: info.clone(),
             width,
             height,
@@ -130,13 +136,11 @@ impl FrameStream {
         (self.width, self.height)
     }
 
-    /// Drain stderr after the child exits (diagnostics on failure).
+    /// The captured stderr tail — join the drain after the child exits
+    /// so the final bytes land (diagnostics on failure).
     fn stderr_tail(&mut self) -> String {
-        let mut buf = String::new();
-        if let Some(mut err) = self.child.stderr.take() {
-            let _ = err.read_to_string(&mut buf);
-        }
-        buf.trim().to_string()
+        self.stderr.join();
+        self.stderr.tail()
     }
 
     /// Fill `buf` completely; returns bytes actually read. A clean EOF at

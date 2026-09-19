@@ -9,6 +9,7 @@ mod decode;
 mod encode;
 mod error;
 mod probe;
+mod stderr;
 
 pub use decode::{Frame, FrameStream};
 pub use encode::Encoder;

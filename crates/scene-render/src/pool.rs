@@ -31,23 +31,25 @@ pub type RendererFactory<'a> =
 /// frame in index order — sharding never reorders output.
 ///
 /// `make_renderer` runs inside each worker thread; `scene`/`timings` are
-/// shared read-only across workers.
+/// shared read-only across workers. A worker panic is caught and comes
+/// back as `Err` — a raster bug must not kill the process (it would
+/// take `engine ui` down mid-request and lose every completed frame).
 pub fn render_frames<'a>(
     scene: &'a ResolvedScene,
     timings: &'a TimingMap,
     frames: Range<u32>,
     workers: usize,
     make_renderer: &RendererFactory<'a>,
-) -> Vec<RenderedFrame> {
+) -> Result<Vec<RenderedFrame>, String> {
     let total = frames.len();
     if total == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let workers = workers.clamp(1, total);
     // Contiguous shards, first workers get the remainder one each.
     let base = total / workers;
     let extra = total % workers;
-    let (tx, rx) = mpsc::channel::<Vec<RenderedFrame>>();
+    let (tx, rx) = mpsc::channel::<Result<Vec<RenderedFrame>, String>>();
 
     thread::scope(|scope| {
         let mut cursor = frames.start;
@@ -57,23 +59,38 @@ pub fn render_frames<'a>(
             cursor = shard.end;
             let tx = tx.clone();
             scope.spawn(move || {
-                let mut renderer = make_renderer(scene, timings);
-                let mut out = Vec::with_capacity(len);
-                for index in shard {
-                    out.push(RenderedFrame {
-                        index,
-                        pixels: renderer.render(index),
-                    });
-                }
-                tx.send(out).expect("render channel open");
+                // AssertUnwindSafe: the renderer is thread-local and
+                // dropped during unwind; nothing escapes but the Err.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut renderer = make_renderer(scene, timings);
+                    let mut out = Vec::with_capacity(len);
+                    for index in shard {
+                        out.push(RenderedFrame {
+                            index,
+                            pixels: renderer.render(index),
+                        });
+                    }
+                    out
+                }))
+                .map_err(|payload| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string())
+                });
+                let _ = tx.send(result); // rx may be gone if we failed early
             });
         }
         drop(tx);
     });
 
-    let mut out: Vec<RenderedFrame> = rx.iter().flatten().collect();
+    let mut out = Vec::with_capacity(total);
+    for shard in rx.iter() {
+        out.extend(shard?);
+    }
     out.sort_by_key(|f| f.index);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -238,7 +255,7 @@ mod tests {
     fn frames_come_back_in_order() {
         let scene = test_scene();
         let timings = TimingMap::default();
-        let out = render_frames(&scene, &timings, 0..90, 4, &renderer);
+        let out = render_frames(&scene, &timings, 0..90, 4, &renderer).unwrap();
         assert_eq!(out.len(), 90);
         for (i, f) in out.iter().enumerate() {
             assert_eq!(f.index, i as u32);
@@ -250,9 +267,9 @@ mod tests {
     fn worker_count_never_changes_bytes() {
         let scene = test_scene();
         let timings = TimingMap::default();
-        let one = render_frames(&scene, &timings, 0..30, 1, &renderer);
-        let four = render_frames(&scene, &timings, 0..30, 4, &renderer);
-        let seven = render_frames(&scene, &timings, 0..30, 7, &renderer);
+        let one = render_frames(&scene, &timings, 0..30, 1, &renderer).unwrap();
+        let four = render_frames(&scene, &timings, 0..30, 4, &renderer).unwrap();
+        let seven = render_frames(&scene, &timings, 0..30, 7, &renderer).unwrap();
         assert_eq!(one, four);
         assert_eq!(four, seven);
     }
@@ -261,8 +278,8 @@ mod tests {
     fn render_twice_is_byte_identical() {
         let scene = test_scene();
         let timings = TimingMap::default();
-        let a = render_frames(&scene, &timings, 0..10, 2, &renderer);
-        let b = render_frames(&scene, &timings, 0..10, 2, &renderer);
+        let a = render_frames(&scene, &timings, 0..10, 2, &renderer).unwrap();
+        let b = render_frames(&scene, &timings, 0..10, 2, &renderer).unwrap();
         assert_eq!(a, b);
     }
 
@@ -271,7 +288,7 @@ mod tests {
         // The stub clip source varies by frame; the rise anim varies too.
         let scene = test_scene();
         let timings = TimingMap::default();
-        let out = render_frames(&scene, &timings, 0..30, 2, &renderer);
+        let out = render_frames(&scene, &timings, 0..30, 2, &renderer).unwrap();
         assert_ne!(out[0].pixels, out[15].pixels);
     }
 
@@ -279,8 +296,12 @@ mod tests {
     fn empty_range_and_more_workers_than_frames() {
         let scene = test_scene();
         let timings = TimingMap::default();
-        assert!(render_frames(&scene, &timings, 0..0, 4, &renderer).is_empty());
-        let out = render_frames(&scene, &timings, 0..3, 8, &renderer);
+        assert!(
+            render_frames(&scene, &timings, 0..0, 4, &renderer)
+                .unwrap()
+                .is_empty()
+        );
+        let out = render_frames(&scene, &timings, 0..3, 8, &renderer).unwrap();
         assert_eq!(out.len(), 3);
     }
 
@@ -325,7 +346,7 @@ mod tests {
             r.programs = Box::new(FixedPrograms);
             r
         }
-        let out = render_frames(&scene, &timings, 0..2, 2, &prog_renderer);
+        let out = render_frames(&scene, &timings, 0..2, 2, &prog_renderer).unwrap();
         // Frame 0 draws rect(10,10,20,10) red over the stub clip; the clip
         // is colorful so "red exactly here" is the program's fingerprint.
         let px = |f: &RenderedFrame, x: usize, y: usize| {
@@ -336,5 +357,36 @@ mod tests {
         // Frame 1's rect is taller — the op saw local_frame=1.
         assert_eq!(px(&out[1], 15, 20), (255, 0, 0));
         assert_ne!(px(&out[0], 15, 20), (255, 0, 0));
+    }
+
+    /// A renderer that explodes on frame 5 — the pool must report it as
+    /// `Err`, not propagate the panic and kill the process.
+    struct FragileFrames;
+    impl FrameSource for FragileFrames {
+        fn sample(&mut self, _src: &str, frame: u64, _fps: f64) -> Option<Frame> {
+            if frame == 5 {
+                panic!("raster exploded at frame 5");
+            }
+            Some(Frame {
+                index: frame,
+                width: 8,
+                height: 8,
+                pixels: vec![0u8; 8 * 8 * 4],
+            })
+        }
+    }
+
+    #[test]
+    fn worker_panic_comes_back_as_an_error() {
+        let scene = test_scene();
+        let timings = TimingMap::default();
+        fn fragile<'a>(scene: &'a ResolvedScene, timings: &'a TimingMap) -> Renderer<'a> {
+            let mut r = renderer(scene, timings);
+            r.clips = Box::new(FragileFrames);
+            r
+        }
+        let res = render_frames(&scene, &timings, 0..30, 4, &fragile);
+        let err = res.expect_err("frame-5 panic should surface as Err");
+        assert!(err.contains("frame 5"), "panic message preserved: {err}");
     }
 }
