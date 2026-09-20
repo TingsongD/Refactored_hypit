@@ -11,7 +11,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde_json::{Value, json};
 
@@ -69,9 +69,14 @@ pub fn fulfill(reg: &Registry, req: &CapRequest) -> Result<PathBuf, CapError> {
         Some(auth) => Some(auth::resolve(auth)?),
         None => None,
     };
-    let doc = req.document().to_string();
+    let staged = scene_media::StagedOutput::new(req.out)?;
+    let mut document = req.document();
+    document["out"] = json!(staged.path().display().to_string());
+    let doc = document.to_string();
     match &cap.connector {
-        Connector::Subprocess { argv } => run_process(cap, argv, &doc, secret.as_deref(), req.out),
+        Connector::Subprocess { argv } => {
+            run_process(cap, argv, &doc, secret.as_deref(), staged.path())
+        }
         Connector::Http { endpoint } => {
             // The bearer header travels in a `-K` config file — argv is
             // visible in `ps`, so a literal `authorization:` argument
@@ -79,19 +84,19 @@ pub fn fulfill(reg: &Registry, req: &CapRequest) -> Result<PathBuf, CapError> {
             let _guard;
             let config = match secret.as_deref() {
                 Some(s) => {
-                    let path = req
-                        .out
-                        .with_extension(format!("{}.curlrc", std::process::id()));
+                    let path = staged.directory().join("credentials.curlrc");
                     write_secret_file(&path, &curl_config(s))?;
                     _guard = CurlRc(path.clone());
                     Some(path)
                 }
                 None => None,
             };
-            let argv = http_args(endpoint, config.as_deref(), req.out);
-            run_process(cap, &argv, &doc, None, req.out)
+            let argv = http_args(endpoint, config.as_deref(), staged.path());
+            run_process(cap, &argv, &doc, None, staged.path())
         }
-    }
+    }?;
+    staged.publish()?;
+    Ok(req.out.to_path_buf())
 }
 
 /// curl argv for the HTTP connector — pure construction, testable.
@@ -169,10 +174,7 @@ fn run_process(
     out: &Path,
 ) -> Result<PathBuf, CapError> {
     let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    cmd.args(&argv[1..]);
     if let Some(s) = secret {
         cmd.env(AUTH_ENV, s);
     }
@@ -183,43 +185,23 @@ fn run_process(
     {
         cmd.env(AUTH_ENV, v);
     }
-    // A stale file at `out` must not masquerade as this request's
-    // output — a connector that exits 0 without writing would otherwise
-    // pass the existence check below.
-    let _ = std::fs::remove_file(out);
-    let mut child = scene_media::spawn_grouped(&mut cmd).map_err(|e| CapError::Spawn {
-        tool: "connector",
-        source: e,
-    })?;
-    // stderr drains on its own thread while stdin writes: a connector
-    // that logs more than a pipe buffer before reading the request
-    // would otherwise deadlock both processes.
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
-    let drain = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut buf);
-        buf
-    });
-    let mut stdin = child.stdin.take().expect("stdin piped");
-    let doc = stdin_json.to_string();
-    let writer = std::thread::spawn(move || {
-        std::io::Write::write_all(&mut stdin, doc.as_bytes()).map_err(|e| e.to_string())
-    });
-    // Deadlined wait: on timeout the child is killed and reaped — the
-    // writer sees EPIPE and the drain hits EOF, so both threads end.
-    let status = scene_media::wait_timeout(&mut child, "connector", CONNECTOR_TIMEOUT);
-    // A failed write means the connector closed stdin early — its exit
-    // status and stderr carry the real story; don't mask it.
-    let _ = writer.join();
-    let stderr_bytes = drain.join().unwrap_or_default();
-    let status = status.map_err(|e| match e {
+    let output = scene_media::run_with_input_timeout(
+        &mut cmd,
+        "connector",
+        CONNECTOR_TIMEOUT,
+        stdin_json.as_bytes(),
+    )
+    .map_err(|e| match e {
         scene_media::MediaError::Io(io) => CapError::Io(io),
+        scene_media::MediaError::Spawn { tool, source } => CapError::Spawn { tool, source },
         other => CapError::Failed {
             cap: cap.name.clone(),
             status: "timeout".to_string(),
-            detail: format!("{other}: {}", String::from_utf8_lossy(&stderr_bytes).trim()),
+            detail: other.to_string(),
         },
     })?;
+    let status = output.status;
+    let stderr_bytes = output.stderr;
     if !status.success() {
         return Err(CapError::Failed {
             cap: cap.name.clone(),

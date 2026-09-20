@@ -288,7 +288,7 @@ mod tests {
             let seed = src.bytes().fold(0u8, |a, b| a.wrapping_add(b));
             let v = seed.wrapping_add((frame * 3) as u8);
             let mut pixels = vec![0u8; 8 * 8 * 4];
-            for c in pixels.chunks_exact_mut(4) {
+            for c in pixels.as_chunks_mut::<4>().0 {
                 c.copy_from_slice(&[v, v / 2, 255 - v, 255]);
             }
             Some(Frame {
@@ -601,7 +601,7 @@ mod tests {
     impl FrameSource for HalfRed {
         fn sample(&mut self, _src: &str, frame: u64, _fps: f64) -> Option<Frame> {
             let mut pixels = vec![0u8; 4 * 4 * 4];
-            for c in pixels.chunks_exact_mut(4) {
+            for c in pixels.as_chunks_mut::<4>().0 {
                 c.copy_from_slice(&[255, 0, 0, 128]);
             }
             Some(Frame {

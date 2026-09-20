@@ -207,7 +207,7 @@ mod tests {
             48.0,
             1.0,
         );
-        assert!(pixmap.data().chunks_exact(4).any(|px| px[3] > 0));
+        assert!(pixmap.data().as_chunks::<4>().0.iter().any(|px| px[3] > 0));
     }
 
     #[test]

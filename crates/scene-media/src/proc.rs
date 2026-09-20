@@ -13,7 +13,8 @@
 //! otherwise outlives its killed parent, keeps the inherited stdout
 //! pipe open, and hangs the pipe-drain join that runs after the kill.
 
-use std::io::Read;
+use command_group::CommandGroup;
+use std::io::{Read, Seek, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -93,39 +94,105 @@ pub struct ProcOutput {
     pub stderr: Vec<u8>,
 }
 
-/// `.output()` with a deadline. Spawns `cmd` (in its own process group)
-/// with null stdin, piped stdout/stderr; drains both on threads so
-/// neither pipe can fill and deadlock against our wait; kills the whole
-/// tree and reaps past `limit`.
-///
-/// On timeout the process *tree* is dead — no surviving grandchild can
-/// hold our end of a pipe — so both drains hit EOF and complete before
-/// the error returns: no leaked threads.
+/// Capture a command with one deadline covering parent exit and pipe EOF.
+/// The process-group / Windows Job handle stays alive after the leader exits.
 pub fn output_timeout(
     cmd: &mut Command,
     tool: &'static str,
     limit: Duration,
 ) -> Result<ProcOutput, MediaError> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = spawn_grouped(cmd).map_err(|e| MediaError::Spawn { tool, source: e })?;
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-    let stderr_pipe = child.stderr.take().expect("stderr piped");
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+    capture_timeout(cmd, tool, limit, None, true)
+}
+
+/// JSON connectors read the same stdin byte stream from an anonymous temporary
+/// file. This removes the blocking writer thread entirely: a child that never
+/// reads stdin cannot prevent timeout cleanup.
+/// Stdout is discarded, preserving the connector contract; stderr is bounded.
+pub fn run_with_input_timeout(
+    cmd: &mut Command,
+    tool: &'static str,
+    limit: Duration,
+    input: &[u8],
+) -> Result<ProcOutput, MediaError> {
+    capture_timeout(cmd, tool, limit, Some(input), false)
+}
+
+fn capture_timeout(
+    cmd: &mut Command,
+    tool: &'static str,
+    limit: Duration,
+    input: Option<&[u8]>,
+    capture_stdout: bool,
+) -> Result<ProcOutput, MediaError> {
+    let deadline = Instant::now() + limit;
+    if let Some(input) = input {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(input)?;
+        file.rewind()?;
+        cmd.stdin(Stdio::from(file));
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(if capture_stdout {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stderr(Stdio::piped());
+    // command-group assigns the Windows Job before resuming the child, so an
+    // immediately exiting shell cannot escape job membership with its children.
+    let mut group = cmd.group();
+    #[cfg(windows)]
+    group.kill_on_drop(true);
+    let mut child = group
+        .spawn()
+        .map_err(|e| MediaError::Spawn { tool, source: e })?;
+    let stdout_pipe = child.inner().stdout.take();
+    let stderr_pipe = child.inner().stderr.take().expect("stderr piped");
+    let out_thread = stdout_pipe.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            pipe.read_to_end(&mut buf).map(|_| buf)
+        })
     });
     let mut err_drain = StderrDrain::start(stderr_pipe);
-    let status = wait_timeout(&mut child, tool, limit);
-    let stdout = out_thread.join().unwrap_or_default();
+    let mut status = None;
+    let result = loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(s) => status = s,
+                Err(e) => break Err(MediaError::Io(e)),
+            }
+        }
+        if let Some(status) = status
+            && out_thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished())
+            && err_drain.is_finished()
+        {
+            break Ok(status);
+        }
+        if Instant::now() >= deadline {
+            break Err(MediaError::TimedOut { tool, limit });
+        }
+        std::thread::sleep(POLL);
+    };
+    if result.is_err() {
+        // Still owns the job/group even if the leader has already exited.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = match out_thread {
+        Some(thread) => thread
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked"))),
+        None => Ok(Vec::new()),
+    };
     err_drain.join();
-    let stderr = err_drain.tail().into_bytes();
     Ok(ProcOutput {
-        status: status?,
-        stdout,
-        stderr,
+        status: result?,
+        stdout: stdout?,
+        stderr: err_drain.tail().into_bytes(),
     })
 }
 
@@ -133,8 +200,60 @@ pub fn output_timeout(
 mod tests {
     use super::*;
 
+    fn fixture(name: &str) -> Command {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name, "--ignored", "--nocapture"]);
+        cmd
+    }
+
+    // These helpers run only as subprocesses, including on Windows where
+    // shell scripts cannot stand in for executable connectors.
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn pipe_holder_fixture() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn parent_exit_fixture() {
+        let _child = fixture("proc::tests::pipe_holder_fixture")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        // Bypass the test harness so this parent really exits first.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn deadline_covers_pipes_after_parent_exit() {
+        let mut cmd = fixture("proc::tests::parent_exit_fixture");
+        let start = Instant::now();
+        let err = output_timeout(&mut cmd, "fixture", Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(err, MediaError::TimedOut { .. }), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn unread_large_stdin_cannot_block_timeout() {
+        let mut cmd = fixture("proc::tests::pipe_holder_fixture");
+        let start = Instant::now();
+        let err = run_with_input_timeout(
+            &mut cmd,
+            "fixture",
+            Duration::from_secs(1),
+            &vec![b'x'; 1024 * 1024],
+        )
+        .unwrap_err();
+        assert!(matches!(err, MediaError::TimedOut { .. }), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
     /// A child that never exits on its own — `cat` waiting on stdin that
     /// stays open… simpler still: `sleep`, present on every unix CI.
+    #[cfg(unix)]
     fn sleeper(secs: &str) -> Child {
         Command::new("sleep")
             .arg(secs)
@@ -209,21 +328,23 @@ mod tests {
     #[test]
     fn wait_timeout_kills_the_grouped_tree() {
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 30 & exec sleep 30"]);
+        cmd.args(["-c", "sleep 30 & exec sleep 30"])
+            .stdout(Stdio::piped());
         let mut child = spawn_grouped(&mut cmd).unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            let _ = tx.send(stdout.read_to_end(&mut Vec::new()));
+        });
         let start = Instant::now();
         let err = wait_timeout(&mut child, "sh", Duration::from_millis(300)).unwrap_err();
         assert!(matches!(err, MediaError::TimedOut { .. }));
         assert!(start.elapsed() < Duration::from_secs(5));
         // Reaped — a second wait reports the killed status.
         assert!(child.try_wait().unwrap().is_some());
-        // The group dies: killpg(sig 0) reports ESRCH once every member
-        // is reaped — poll briefly, orphan reaping isn't synchronous.
-        let gone = (0..20).any(|_| {
-            std::thread::sleep(Duration::from_millis(100));
-            let rc = unsafe { libc::killpg(child.id() as i32, 0) };
-            rc != 0
-        });
-        assert!(gone, "grandchild's group should be dead");
+        // EOF proves descendants released the pipe, without depending on the
+        // host init promptly reaping orphaned zombie processes.
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        drain.join().unwrap();
     }
 }

@@ -458,7 +458,7 @@ fn rounded_rect_path(rect: tiny_skia::Rect, radius: f32) -> Option<tiny_skia::Pa
 /// `-pix_fmt rgba` and `image::to_rgba8` both deliver straight alpha;
 /// tiny-skia's pixmap contract is premultiplied.
 fn premultiply(pixels: &mut [u8]) {
-    for px in pixels.chunks_exact_mut(4) {
+    for px in pixels.as_chunks_mut::<4>().0 {
         let a = u32::from(px[3]);
         px[0] = ((u32::from(px[0]) * a + 127) / 255) as u8;
         px[1] = ((u32::from(px[1]) * a + 127) / 255) as u8;

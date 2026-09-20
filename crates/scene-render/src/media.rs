@@ -221,7 +221,7 @@ impl FrameSource for SeqFrameSource {
 /// missing clip reads as intentional, not a black hole.
 pub fn placeholder_frame(width: u32, height: u32) -> Frame {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
-    for chunk in pixels.chunks_exact_mut(4) {
+    for chunk in pixels.as_chunks_mut::<4>().0 {
         chunk.copy_from_slice(&[0x18, 0x1a, 0x20, 0xff]);
     }
     Frame {
