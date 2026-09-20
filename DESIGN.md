@@ -68,9 +68,15 @@ is set — CI runs them on the legs that install ffmpeg.
 Facts a change must preserve — each is pinned by a test:
 
 - **Worker-count determinism covers state.** Before rasterizing its
-  shard, a worker replays every `ops()` call the shard's prefix frames
+  shard, a worker replays every `ops()` call frames `0..shard.start`
   would have made (layout only, no pixels). A `render()` that
-  accumulates on `d` produces identical output at 1 or N workers.
+  accumulates on `d` produces identical output at 1 or N workers — and
+  under `--frames` windows, which replay the same prefix from scene
+  start rather than from the window's first frame.
+- **Program state is per element instance.** The sandbox keys each
+  `Program` by element identity, not `(src, with)` — two identical
+  `<program>` elements get independent runtimes, so `setup`/`d` can't
+  leak between them.
 - **Sequential media can go backward by reopening.** A `sample` target
   behind the decode head respawns the stream (with `-ss` when deep);
   serving the stale current frame is the bug that motivated it.
@@ -97,12 +103,26 @@ Facts a change must preserve — each is pinned by a test:
   lexical `..` normalization plus canonicalization of the deepest
   existing ancestor, so symlinks inside the root can't tunnel out.
   `--out` is the operator's argument and is used verbatim.
-- **Every subprocess has a deadline.** `proc::wait_timeout` /
-  `output_timeout` kill+reap past a limit on all wait/output call sites.
-  Streaming decode/encode can't use a wait deadline (a blocked pipe
-  `read`/`write` can't rescue itself), so they arm a `StallWatchdog`:
-  heartbeat per successful I/O, SIGKILL by pid on unix when it goes
-  stale, fixed deadlines on EOF reap and muxer teardown.
+- **Every subprocess has a deadline, and deadlines kill the tree.**
+  `proc::wait_timeout` / `output_timeout` kill+reap past a limit on all
+  wait/output call sites. Managed children spawn in their own process
+  group (`spawn_grouped`), so the kill takes descendants too — a
+  connector's `curl` grandchild can't outlive its parent holding our
+  pipes open. Streaming decode/encode can't use a wait deadline (a
+  blocked pipe `read`/`write` can't rescue itself), so they arm a
+  `StallWatchdog`: heartbeat per successful I/O, `killpg` on unix /
+  `taskkill /T` on Windows when it goes stale, fixed deadlines on EOF
+  reap and muxer teardown.
+- **Renders publish atomically.** The encoder writes a unique sibling
+  temp (`name.tmp-PID-SEQ.ext`); the final target is replaced by rename
+  only after `finish()` succeeds — `-y` can truncate the temp, never a
+  previous good output. Intermediate WAVs get unique names too, so a
+  failed render deletes only its own litter.
+- **`adapt` imports footage into the project.** With `--out`, a source
+  outside the scene's root is copied into its `assets/` (never
+  clobbering an unrelated file — numeric suffixes), and downloads
+  relocate outright; the emitted `src` always resolves inside the root
+  it will be rendered under.
 - **Asset and program failures report through `WarnSink`.** Media
   sources and `SandboxPrograms` share one `BTreeSet` sink — dedup for
   free, surfaced in the render diagnostics bundle and the UI.

@@ -96,6 +96,7 @@ impl<'a> Renderer<'a> {
         match &placed.element.kind {
             ElementKind::Program { src, with } => {
                 let _ = self.programs.ops(
+                    placed.element as *const _ as usize,
                     src,
                     placed.local_frame,
                     with.as_deref().unwrap_or("{}"),
@@ -214,6 +215,7 @@ impl<'a> Renderer<'a> {
             }
             ElementKind::Program { src, with } => {
                 match self.programs.ops(
+                    placed.element as *const _ as usize,
                     src,
                     placed.local_frame,
                     with.as_deref().unwrap_or("{}"),

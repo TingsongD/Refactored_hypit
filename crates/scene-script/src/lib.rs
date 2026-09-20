@@ -156,19 +156,20 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("escape.js"), root.join("link.js")).unwrap();
 
         let mut progs = SandboxPrograms::new(root.clone());
-        assert!(progs.ops("ok.js", 0, "{}", 10.0, 10.0).is_some());
+        assert!(progs.ops(1, "ok.js", 0, "{}", 10.0, 10.0).is_some());
         let rel = format!("../prog-out-{}", std::process::id());
         assert!(
             progs
-                .ops(&format!("{rel}/escape.js"), 0, "{}", 10.0, 10.0)
+                .ops(1, &format!("{rel}/escape.js"), 0, "{}", 10.0, 10.0)
                 .is_none()
         );
         #[cfg(unix)]
-        assert!(progs.ops("link.js", 0, "{}", 10.0, 10.0).is_none());
+        assert!(progs.ops(1, "link.js", 0, "{}", 10.0, 10.0).is_none());
         // Absolute paths outside the root don't resolve either.
         assert!(
             progs
                 .ops(
+                    1,
                     outside.join("escape.js").to_str().unwrap(),
                     0,
                     "{}",
@@ -199,15 +200,44 @@ mod tests {
             DrawOp::Rect { x, .. } => *x,
             _ => panic!("rect"),
         };
-        // step=1: setup adds 1, render adds 1 → 2.
-        let a = progs.ops("p.js", 0, r#"{"step":1}"#, 1.0, 1.0).unwrap();
+        // Element 1 (step=1): setup adds 1, render adds 1 → 2.
+        let a = progs.ops(1, "p.js", 0, r#"{"step":1}"#, 1.0, 1.0).unwrap();
         assert_eq!(x(a), 2.0);
-        // step=10 with a different payload must not inherit `d.x` = 2.
-        let b = progs.ops("p.js", 0, r#"{"step":10}"#, 1.0, 1.0).unwrap();
+        // Element 2 (step=10) must not inherit element 1's `d.x` = 2.
+        let b = progs.ops(2, "p.js", 0, r#"{"step":10}"#, 1.0, 1.0).unwrap();
         assert_eq!(x(b), 20.0);
-        // And back on step=1 state continues where it left off (3, 4…).
-        let c = progs.ops("p.js", 1, r#"{"step":1}"#, 1.0, 1.0).unwrap();
+        // And element 1's state continues where it left off (3, 4…).
+        let c = progs.ops(1, "p.js", 1, r#"{"step":1}"#, 1.0, 1.0).unwrap();
         assert_eq!(x(c), 3.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn identical_src_and_with_still_get_independent_state() {
+        // The review finding: two elements with *the same* src and `with`
+        // shared one runtime — a counter on `d` advanced for both. The
+        // element key must split them even when the source identity
+        // collides.
+        let root = std::env::temp_dir().join(format!("prog-twin-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("p.js"),
+            "function setup(d){ d.n = 0; }\n\
+             function render(ctx,f,d){ d.n += 1; ctx.rect(d.n,0,1,1); }",
+        )
+        .unwrap();
+        let mut progs = SandboxPrograms::new(root.clone());
+        let x = |list: DrawList| match &list.0[0] {
+            DrawOp::Rect { x, .. } => *x,
+            _ => panic!("rect"),
+        };
+        // Element 1 runs two frames — its counter reaches 2.
+        assert_eq!(x(progs.ops(1, "p.js", 0, "{}", 1.0, 1.0).unwrap()), 1.0);
+        assert_eq!(x(progs.ops(1, "p.js", 1, "{}", 1.0, 1.0).unwrap()), 2.0);
+        // Element 2 — same src, same `with` — starts its own counter.
+        assert_eq!(x(progs.ops(2, "p.js", 0, "{}", 1.0, 1.0).unwrap()), 1.0);
+        // And element 1 is still where it left off, not polluted by 2.
+        assert_eq!(x(progs.ops(1, "p.js", 2, "{}", 1.0, 1.0).unwrap()), 3.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

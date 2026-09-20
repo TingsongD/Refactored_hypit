@@ -187,7 +187,7 @@ fn run_process(
     // output — a connector that exits 0 without writing would otherwise
     // pass the existence check below.
     let _ = std::fs::remove_file(out);
-    let mut child = cmd.spawn().map_err(|e| CapError::Spawn {
+    let mut child = scene_media::spawn_grouped(&mut cmd).map_err(|e| CapError::Spawn {
         tool: "connector",
         source: e,
     })?;

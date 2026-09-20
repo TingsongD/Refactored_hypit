@@ -208,3 +208,72 @@ fn ducking_actually_ducks() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression: an unpadded key ends at the voice clip's end, and
+/// sidechaincompress (a framesync filter) stops emitting — the music
+/// went silent the moment narration stopped. The key must be padded.
+#[test]
+fn ducked_music_survives_past_the_key() {
+    if !gated() {
+        return;
+    }
+    let dir = tempdir("duck-tail");
+    let music = sine(&dir, "bed.wav", 440, 3);
+    let voice = sine(&dir, "vo.wav", 880, 1);
+    let out = dir.join("mix.wav");
+    let graph = AudioGraph {
+        clips: vec![
+            clip(music, 0, 3, 0.0, "music"),
+            clip(voice, 0, 1, 0.0, "voice"), // voice ends at 1s
+        ],
+        duck: vec![DuckLink {
+            clip: 0,
+            key: vec![1],
+        }],
+        program_samples: 3 * PROGRAM_RATE,
+    };
+    mix_program(&graph, &out).unwrap();
+    // The music bed must still be audible well past the key's end.
+    let tail = segment_level(&out, 2.2, 2.8, true);
+    assert!(
+        tail > -45.0,
+        "music must outlive the voice key — got {tail} dB at 2.2–2.8s"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: two music elements ducking the same voice used to emit
+/// `[a1k]` twice — "Invalid stream specifier" from ffmpeg.
+#[test]
+fn two_ducks_share_one_key() {
+    if !gated() {
+        return;
+    }
+    let dir = tempdir("duck2");
+    let bed1 = sine(&dir, "bed1.wav", 440, 2);
+    let bed2 = sine(&dir, "bed2.wav", 330, 2);
+    let voice = sine(&dir, "vo.wav", 880, 2);
+    let out = dir.join("mix.wav");
+    let graph = AudioGraph {
+        clips: vec![
+            clip(bed1, 0, 2, 0.0, "music"),
+            clip(voice, 0, 2, 0.0, "voice"),
+            clip(bed2, 0, 2, 0.0, "music"),
+        ],
+        duck: vec![
+            DuckLink {
+                clip: 0,
+                key: vec![1],
+            },
+            DuckLink {
+                clip: 2,
+                key: vec![1],
+            },
+        ],
+        program_samples: 2 * PROGRAM_RATE,
+    };
+    mix_program(&graph, &out).unwrap();
+    let info = probe(&out).unwrap();
+    assert!((info.duration_s - 2.0).abs() < 0.05, "{}s", info.duration_s);
+    let _ = std::fs::remove_dir_all(&dir);
+}

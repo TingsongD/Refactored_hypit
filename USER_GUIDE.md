@@ -210,7 +210,12 @@ Guarantees worth knowing:
 
 - State accumulated on `d` is **deterministic at any worker count** — a
   worker starting mid-range replays the prefix's `render` calls first.
-- Under `--frames a:b`, `f` and `d` see only the window.
+- `d` is per *element instance* — two `<program>` elements with the
+  same `src` and `with` get independent runtimes; a counter stashed on
+  `d` can't leak between them.
+- Under `--frames a:b` the program still replays from scene start, so
+  `f`/`d` carry the same values a full render would — a window only
+  changes which frames are emitted.
 - Malformed ops are dropped, not fatal; a crashed program fails once
   (cached), then every frame, and the failure lands in the render's
   diagnostics bundle.
@@ -229,11 +234,16 @@ engine render main.scene --workers 8         # default 4
 - `--timings` — the `TimingMap` JSON from `align`. Without it, literal
   anchors (`1.5s..4s`) still resolve; cue anchors error.
 - `--frames a:b` renders only that window. The audio mix is clipped to
-  the same window, so partial renders sound right.
+  the same window, so partial renders sound right, and stateful
+  `<program>` scripts replay from scene start — window pixels match a
+  full render exactly.
 - Output is byte-identical for any `--workers` value — worker count
   changes speed, never pixels.
 - Memory is bounded: roughly `workers × 5 + 1` frames (~340 MB at 8
   workers on 1080×1920), independent of video length.
+- A failed render never touches an existing output — frames encode to a
+  temporary sibling file and only replace the target once the encode
+  succeeds.
 
 ## Adapt — draft a scene from footage
 
@@ -245,7 +255,10 @@ engine adapt https://… --out-dir assets --out draft.scene   # URLs via yt-dlp
 Probes the media, detects hard cuts, and emits a starting-point scene:
 full-span clip + one labeled board per shot + a music track when the
 source has audio. The draft always parses clean — edit it, don't ship
-it.
+it. When `--out` lands the draft somewhere other than the footage's
+directory, the footage is imported into the draft's `assets/` first
+(a yt-dlp download moves outright) — the emitted `src` never escapes
+the scene's project root.
 
 ## Capabilities — generated assets
 

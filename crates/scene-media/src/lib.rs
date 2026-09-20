@@ -19,5 +19,5 @@ pub use decode::{Frame, FrameStream};
 pub use encode::Encoder;
 pub use error::{MediaError, Tool};
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, parse_probe_json, probe};
-pub use proc::{ProcOutput, output_timeout, wait_timeout};
+pub use proc::{ProcOutput, output_timeout, spawn_grouped, wait_timeout};
 pub use watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};

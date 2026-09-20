@@ -4,7 +4,8 @@
 //!
 //! Graph shape per clip `i`:
 //!   [i:a]atrim → asetpts → aresample → aformat → volume → afade(s)
-//!         → adelay → [a{i}]  (+ asplit if it keys someone's duck)
+//!         → adelay → [a{i}]  (+ asplit if it keys someone's duck — one
+//!         key label per consuming link; labels are single-use)
 //! Ducking uses real sidechain compression: the duck target's clips are
 //! submixed into a key signal that drives `sidechaincompress` on the
 //! ducked clip — no volume-expression approximation.
@@ -38,12 +39,15 @@ pub fn filter_complex(graph: &AudioGraph) -> String {
     let mut out = String::new();
     let mut chains: Vec<String> = Vec::with_capacity(graph.clips.len());
 
-    // Which clips serve as duck keys — they need a split: one branch to
-    // the main mix, one to the key submix.
-    let mut is_key = vec![false; graph.clips.len()];
+    let program_s = graph.program_samples as f64 / PROGRAM_RATE as f64;
+
+    // Which clips serve as duck keys — and how many links consume them.
+    // A named label is single-use, so a clip keyed by N links needs N+1
+    // split outputs: one main-mix branch plus one key branch per link.
+    let mut key_uses = vec![0usize; graph.clips.len()];
     for link in &graph.duck {
         for &k in &link.key {
-            is_key[k] = true;
+            key_uses[k] += 1;
         }
     }
 
@@ -67,30 +71,46 @@ pub fn filter_complex(graph: &AudioGraph) -> String {
         }
         let ms = samples_to_ms(clip.target.start);
         chain += &format!(",adelay={ms}|{ms}");
-        if is_key[i] {
-            chain += &format!(",asplit=2[a{i}m][a{i}k]");
+        if key_uses[i] > 0 {
+            chain += &format!(",asplit={}[a{i}m]", key_uses[i] + 1);
+            for j in 0..key_uses[i] {
+                chain += &format!("[a{i}k{j}]");
+            }
         } else {
             chain += &format!("[a{i}]");
         }
         chains.push(chain);
     }
 
-    // Duck links: key submix → sidechaincompress the ducked clip.
+    // Duck links: key submix → sidechaincompress the ducked clip. The
+    // key must be padded to program length — sidechaincompress is a
+    // framesync filter and stops when its secondary input ends, so an
+    // unpadded key would silence the music the moment narration stops.
     let mut mix_label: Vec<String> = (0..graph.clips.len())
         .map(|i| {
-            if is_key[i] {
+            if key_uses[i] > 0 {
                 format!("a{i}m")
             } else {
                 format!("a{i}")
             }
         })
         .collect();
+    let mut next_use = vec![0usize; graph.clips.len()];
     for (l, link) in graph.duck.iter().enumerate() {
         let key_label = format!("key{l}");
-        let keys: String = link.key.iter().map(|k| format!("[a{k}k]")).collect();
+        let keys: String = link
+            .key
+            .iter()
+            .map(|&k| {
+                let j = next_use[k];
+                next_use[k] += 1;
+                format!("[a{k}k{j}]")
+            })
+            .collect();
         out += &format!(
-            "{keys}amix=inputs={}:normalize=0[{key_label}];",
-            link.key.len()
+            "{keys}amix=inputs={}:normalize=0[{key_label}raw];[{key_label}raw]apad=whole_dur={}[{key_label}];",
+            link.key.len(),
+            fmt(program_s)
         );
         out += &format!(
             "[{}][{key_label}]sidechaincompress=threshold={}:ratio={}:attack={}:release={}[duck{l}];",
@@ -112,7 +132,6 @@ pub fn filter_complex(graph: &AudioGraph) -> String {
     // mixes 0.5s. `apad` extends with silence to the program length so
     // the muxer's `-shortest` can't truncate the video track; `-t` in
     // mix_args still cuts any overshoot to the program exactly.
-    let program_s = graph.program_samples as f64 / PROGRAM_RATE as f64;
     out += &format!(
         "{inputs}amix=inputs={}:normalize=0,apad=whole_dur={}[aout]",
         mix_label.len(),

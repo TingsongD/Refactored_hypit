@@ -68,3 +68,7 @@ The `Shot N` placeholders are where your content goes:
 - `adapt` never stores word timing; literal `Ns..Ms` anchors are what
   the draft uses. Bring in `<script>` + `align` when you want symbolic
   timing.
+- Footage outside the draft's directory is imported into its `assets/`
+  first (`--out nested/draft.scene` gets its own copy) — the emitted
+  `src` always stays inside the scene's project root, which is what
+  render's source confinement requires.

@@ -297,12 +297,55 @@ pub struct RenderError {
     pub bundles: Vec<DiagBundle>,
 }
 
-/// Removes its file on drop — a program.wav left behind by a failed
+/// Removes its file on drop — a program wav left behind by a failed
 /// render (mix error, encode error, even a partial mix) is just litter.
 struct TempWav(PathBuf);
 impl Drop for TempWav {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A unique sibling path for intermediate output: `name.tag-PID-SEQ.ext`
+/// next to `target`. Same-dir keeps the final `fs::rename` atomic; the
+/// pid+seq pair keeps concurrent in-process renders from colliding, so a
+/// temp path can never name (and `-y`-clobber) a file the user owns.
+fn unique_sibling(target: &Path, tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+    let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    target.with_file_name(format!("{stem}.{tag}-{pid}-{seq}.{ext}"))
+}
+
+/// Publish `tmp` as `target`, replacing any previous output. Runs only
+/// after a fully successful render — a failed render leaves the prior
+/// output file untouched. The temp must exist before `target` is
+/// touched; unix `rename` replaces atomically, Windows needs a
+/// remove-then-rename fallback.
+fn publish(tmp: &Path, target: &Path) -> Result<(), String> {
+    if !tmp.exists() {
+        return Err(format!("render output {} is missing", tmp.display()));
+    }
+    match fs::rename(tmp, target) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            if target.exists() {
+                fs::remove_file(target)
+                    .map_err(|e| format!("cannot replace {}: {e}", target.display()))?;
+                fs::rename(tmp, target).map_err(|e| {
+                    format!("cannot move {} to {}: {e}", tmp.display(), target.display())
+                })
+            } else {
+                Err(format!(
+                    "cannot move {} to {}: {first}",
+                    tmp.display(),
+                    target.display()
+                ))
+            }
+        }
     }
 }
 
@@ -469,7 +512,8 @@ pub fn render_inner(
     let program_wav = if graph.clips.is_empty() {
         None
     } else {
-        let wav = target.with_extension("program.wav");
+        // `.wav` — the mixer's ffmpeg picks its muxer by extension.
+        let wav = unique_sibling(&target, "program").with_extension("wav");
         let guard = TempWav(wav);
         if let Err(e) = mix_program(&graph, &guard.0) {
             return Err(stage(format!("audio mix failed: {e}"), bundles));
@@ -477,8 +521,12 @@ pub fn render_inner(
         Some(guard)
     };
 
+    // Render into a unique sibling temp, publish on success — `-y` may
+    // truncate the temp all it wants; the previous good output survives
+    // any failed render.
+    let tmp_target = unique_sibling(&target, "tmp");
     let mut encoder = match Encoder::open_muxed_opt(
-        &target,
+        &tmp_target,
         resolved.canvas.width,
         resolved.canvas.height,
         &resolved.frame_rate,
@@ -496,8 +544,8 @@ pub fn render_inner(
     // Frames stream straight into the encoder as workers finish them —
     // no whole-video frame buffer. On any failure the pool cancels its
     // workers and joins them before returning Err; Encoder::drop kills
-    // ffmpeg, and the -y-truncated target is a corpse — remove it so
-    // nothing serves a partial video.
+    // ffmpeg, and the truncated temp is removed — the real target is
+    // only ever written by a successful publish.
     let (cw, ch) = (resolved.canvas.width, resolved.canvas.height);
     let frames_done =
         match render_frames_into(&resolved, &timings, range, workers.max(1), &make, |f| {
@@ -507,7 +555,7 @@ pub fn render_inner(
         }) {
             Ok(n) => n,
             Err(e) => {
-                let _ = fs::remove_file(&target);
+                let _ = fs::remove_file(&tmp_target);
                 return Err(stage(e, bundles));
             }
         };
@@ -524,8 +572,12 @@ pub fn render_inner(
         });
     }
     if let Err(e) = encoder.finish() {
-        let _ = fs::remove_file(&target);
+        let _ = fs::remove_file(&tmp_target);
         return Err(stage(e.to_string(), bundles));
+    }
+    if let Err(e) = publish(&tmp_target, &target) {
+        let _ = fs::remove_file(&tmp_target);
+        return Err(stage(e, bundles));
     }
     Ok(RenderReport {
         frames: frames_done,
@@ -714,6 +766,16 @@ fn load_registry(config: &Path) -> Result<scene_cap::Registry, String> {
     scene_cap::Registry::from_toml(&text)
 }
 
+/// Each tool's version flag — `yt-dlp`/`uv` take GNU-style `--version`;
+/// the ffmpeg family takes its own `-version`. The wrong flag exits
+/// nonzero, which must read as missing, not "ok".
+fn version_arg(tool: &str) -> &'static str {
+    match tool {
+        "ffmpeg" | "ffprobe" => "-version",
+        _ => "--version",
+    }
+}
+
 /// Probe the external tools the engine will shell out to. Everything here
 /// is optional at parse time but needed for real renders.
 pub fn doctor() -> i32 {
@@ -725,20 +787,29 @@ pub fn doctor() -> i32 {
     ];
     let mut missing = 0;
     for (tool, role) in tools {
-        // `-version` exits instantly on a healthy binary; ten seconds
-        // catches a wedged shim/wrapper instead of hanging doctor.
+        // A version probe exits instantly on a healthy binary; ten seconds
+        // catches a wedged shim/wrapper instead of hanging doctor. The
+        // status must be a success — a binary that errors on its own
+        // version flag is present but unusable.
         match scene_media::output_timeout(
-            Command::new(tool).arg("-version"),
+            Command::new(tool).arg(version_arg(tool)),
             tool,
             std::time::Duration::from_secs(10),
         ) {
-            Ok(out) => {
+            Ok(out) if out.status.success() => {
                 let first = String::from_utf8_lossy(&out.stdout)
                     .lines()
                     .next()
                     .unwrap_or("")
                     .to_string();
                 println!("  ok      {tool:<8} {first}");
+            }
+            Ok(out) => {
+                missing += 1;
+                println!(
+                    "  MISSING {tool:<8} ({role}) — exits {status}",
+                    status = out.status
+                );
             }
             Err(_) => {
                 missing += 1;
@@ -783,12 +854,12 @@ fn normalized_components(path: &Path) -> Vec<std::ffi::OsString> {
     out
 }
 
-/// The src written into the draft scene, expressed against the directory
-/// the scene will live in — the draft resolves assets against its own
-/// path, so `--out nested/draft.scene` must not inherit cwd-relative
-/// paths. Both endpoints inside the cwd → a (possibly `..`-climbing)
-/// relative path, portable with the project tree; anything outside →
-/// the absolute path, which resolves from anywhere.
+/// The src written into a draft printed to *stdout* — the scene's root
+/// is unknown (the user decides where to save it), so the best we can
+/// do is express the path against the cwd: relative when both endpoints
+/// sit inside it, absolute otherwise. `engine adapt --out file.scene`
+/// takes [`place_in_scene`] instead, which imports the footage so the
+/// draft always renders under source confinement.
 fn adapt_src(path: &Path, scene_dir: &Path) -> String {
     let a = normalized_components(scene_dir);
     let b = normalized_components(path);
@@ -809,6 +880,76 @@ fn adapt_src(path: &Path, scene_dir: &Path) -> String {
     }
 }
 
+/// Express `path` as a src usable inside `scene_dir`'s project root.
+/// Source confinement refuses anything outside the root, so footage
+/// that isn't already inside gets *imported* into `scene_dir/assets/`
+/// — a draft written next to its own assets always renders. `relocate`
+/// moves the file instead of copying, for media the engine itself just
+/// produced (a yt-dlp download the draft can claim outright).
+fn place_in_scene(path: &Path, scene_dir: &Path, relocate: bool) -> std::io::Result<PathBuf> {
+    let root = scene_dir.canonicalize()?;
+    let src_abs = path.canonicalize()?;
+    let placed = if src_abs.starts_with(&root) {
+        src_abs
+    } else {
+        import_media(&src_abs, scene_dir, relocate)?.canonicalize()?
+    };
+    Ok(placed.strip_prefix(&root).unwrap_or(&placed).to_path_buf())
+}
+
+/// Copy (or move) `path` into `<scene_dir>/assets/`, never overwriting
+/// an unrelated file — `name-2.ext`, `name-3.ext`, … until a free slot.
+/// A candidate that *is* the source (same file, already imported) is
+/// reused as-is. Returns the absolute path the file landed at.
+fn import_media(path: &Path, scene_dir: &Path, relocate: bool) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    let assets = scene_dir.join("assets");
+    std::fs::create_dir_all(&assets)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "source has no file name"))?;
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "media".into());
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 0..100u32 {
+        let candidate = assets.join(if n == 0 {
+            name.to_os_string()
+        } else {
+            match &ext {
+                Some(e) => format!("{stem}-{n}.{e}").into(),
+                None => format!("{stem}-{n}").into(),
+            }
+        });
+        if candidate.exists() {
+            // Same file already sitting there? Then it's imported
+            // already — reuse it rather than duplicating.
+            if candidate.canonicalize().ok().as_deref() == Some(path) {
+                return Ok(candidate);
+            }
+            continue;
+        }
+        if relocate {
+            match std::fs::rename(path, &candidate) {
+                Ok(()) => return Ok(candidate),
+                // Cross-device — copy, then drop the original download.
+                Err(_) => {
+                    std::fs::copy(path, &candidate)?;
+                    let _ = std::fs::remove_file(path);
+                    return Ok(candidate);
+                }
+            }
+        }
+        std::fs::copy(path, &candidate)?;
+        return Ok(candidate);
+    }
+    Err(Error::new(
+        ErrorKind::AlreadyExists,
+        "assets/ has no free name for the import",
+    ))
+}
+
 /// `engine adapt <source>` — ingest, analyze, emit a draft .scene.
 pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
     let ingested = match scene_adapt::ingest(source, out_dir) {
@@ -825,13 +966,35 @@ pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
             return 1;
         }
     };
-    // The draft resolves assets against its own directory — express the
-    // source against wherever the scene will actually be written.
-    let scene_dir = out
+    // The draft resolves assets against its own directory. With `--out`
+    // the footage is imported under that root so the emitted src never
+    // escapes it; a stdout draft has no root yet — express the source
+    // against the cwd instead.
+    let src = match out
         .and_then(Path::parent)
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let src = adapt_src(&ingested.path, scene_dir);
+    {
+        Some(scene_dir) => {
+            if let Err(e) = std::fs::create_dir_all(scene_dir) {
+                eprintln!("adapt: mkdir {}: {e}", scene_dir.display());
+                return 1;
+            }
+            match place_in_scene(&ingested.path, scene_dir, ingested.fetched) {
+                Ok(rel) => {
+                    let rel = rel.to_string_lossy().into_owned();
+                    if rel != ingested.path.to_string_lossy() {
+                        eprintln!("adapt: imported footage at {rel}");
+                    }
+                    rel
+                }
+                Err(e) => {
+                    eprintln!("adapt: import {}: {e}", ingested.path.display());
+                    return 1;
+                }
+            }
+        }
+        None => adapt_src(&ingested.path, Path::new(".")),
+    };
     let markup = scene_adapt::emit_scene(&src, &analysis);
 
     eprintln!(
@@ -928,7 +1091,42 @@ mod tests {
     }
 
     #[test]
-    fn adapt_src_resolves_against_the_scene_dir() {
+    fn unique_sibling_is_unique_and_keeps_extension() {
+        let target = Path::new("out/final.mp4");
+        let a = unique_sibling(target, "tmp");
+        let b = unique_sibling(target, "tmp");
+        assert_ne!(a, b);
+        assert_eq!(a.extension().unwrap(), "mp4");
+        assert_eq!(a.parent().unwrap(), Path::new("out"));
+        assert!(
+            a.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("final.tmp-")
+        );
+    }
+
+    #[test]
+    fn publish_replaces_only_on_success() {
+        let dir = std::env::temp_dir().join(format!("publish-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("final.mp4");
+        let tmp = unique_sibling(&target, "tmp");
+        fs::write(&target, b"old-good").unwrap();
+        fs::write(&tmp, b"new-good").unwrap();
+        publish(&tmp, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new-good");
+        assert!(!tmp.exists());
+        // A publish failure (missing temp) leaves the old output alone.
+        let gone = dir.join("gone.mp4");
+        assert!(publish(&gone, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"new-good");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adapt_src_resolves_against_the_cwd_for_stdout() {
         let cwd = std::env::current_dir().unwrap();
         // Same-dir case: source beside the scene stays a bare name.
         assert_eq!(
@@ -956,6 +1154,87 @@ mod tests {
         // Absolute source inside the project still relativizes.
         let under = cwd.join("assets").join("v.mp4");
         assert_eq!(adapt_src(&under, Path::new(".")), "assets/v.mp4");
+    }
+
+    /// The review repro: `adapt clip.mp4 --out nested/draft.scene` used
+    /// to emit `src="../clip.mp4"` — which source confinement refuses at
+    /// render. Now footage outside the scene root is *imported* into the
+    /// project's assets/, and the src stays inside.
+    #[test]
+    fn place_in_scene_imports_outside_footage() {
+        let dir = std::env::temp_dir().join(format!("adapt-import-{}", std::process::id()));
+        let scene_dir = dir.join("nested");
+        let src = dir.join("clip.mp4");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&src, b"footage").unwrap();
+        fs::create_dir_all(&scene_dir).unwrap();
+        let rel = place_in_scene(&src, &scene_dir, false).unwrap();
+        assert_eq!(rel, Path::new("assets").join("clip.mp4"));
+        // Copied, not moved — the user's original stays put.
+        assert_eq!(fs::read(&src).unwrap(), b"footage");
+        assert_eq!(
+            fs::read(scene_dir.join("assets/clip.mp4")).unwrap(),
+            b"footage"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn place_in_scene_reuses_inside_footage() {
+        let dir = std::env::temp_dir().join(format!("adapt-inside-{}", std::process::id()));
+        let scene_dir = dir.join("proj");
+        let src = scene_dir.join("media/clip.mp4");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, b"footage").unwrap();
+        let rel = place_in_scene(&src, &scene_dir, false).unwrap();
+        assert_eq!(rel, Path::new("media").join("clip.mp4"));
+        // Nothing copied — no assets/ dir created for inside sources.
+        assert!(!scene_dir.join("assets").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_media_never_clobbers_an_unrelated_file() {
+        let dir = std::env::temp_dir().join(format!("adapt-collide-{}", std::process::id()));
+        let scene_dir = dir.join("proj");
+        let existing = scene_dir.join("assets/clip.mp4");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, b"someone-else").unwrap();
+        let src = dir.join("clip.mp4");
+        fs::write(&src, b"footage").unwrap();
+        let placed = import_media(&src, &scene_dir, false).unwrap();
+        assert!(placed.ends_with("clip-1.mp4"), "{}", placed.display());
+        // The unrelated file is untouched.
+        assert_eq!(fs::read(&existing).unwrap(), b"someone-else");
+        assert_eq!(fs::read(&placed).unwrap(), b"footage");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn place_in_scene_relocates_fetched_footage() {
+        let dir = std::env::temp_dir().join(format!("adapt-move-{}", std::process::id()));
+        let scene_dir = dir.join("proj");
+        let download = dir.join("dl/adapt-source.mp4");
+        fs::create_dir_all(download.parent().unwrap()).unwrap();
+        fs::create_dir_all(&scene_dir).unwrap();
+        fs::write(&download, b"fetched").unwrap();
+        let rel = place_in_scene(&download, &scene_dir, true).unwrap();
+        assert_eq!(rel, Path::new("assets").join("adapt-source.mp4"));
+        // Moved — the download dir is empty of the file.
+        assert!(!download.exists());
+        assert_eq!(
+            fs::read(scene_dir.join("assets/adapt-source.mp4")).unwrap(),
+            b"fetched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_uses_each_tools_own_version_flag() {
+        assert_eq!(version_arg("ffmpeg"), "-version");
+        assert_eq!(version_arg("ffprobe"), "-version");
+        assert_eq!(version_arg("yt-dlp"), "--version");
+        assert_eq!(version_arg("uv"), "--version");
     }
 
     fn scene_with_script(text: &str) -> scene_ir::Scene {

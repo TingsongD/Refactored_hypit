@@ -153,6 +153,7 @@ pub struct NullPrograms;
 impl ProgramSource for NullPrograms {
     fn ops(
         &mut self,
+        _element: usize,
         _src: &str,
         _local_frame: u32,
         _with: &str,
@@ -165,7 +166,22 @@ impl ProgramSource for NullPrograms {
 pub trait ProgramSource {
     /// Ops for `local_frame` inside a `w`×`h` box, or `None` when the
     /// program can't run — the rasterizer draws its placeholder.
-    fn ops(&mut self, src: &str, local_frame: u32, with: &str, w: f64, h: f64) -> Option<DrawList>;
+    ///
+    /// `element` is an opaque, stable identity for the *element
+    /// instance* making the call (the rasterizer passes the resolved
+    /// element's address — the scene outlives the render, so it's
+    /// unique and constant). Two elements with identical `src` and
+    /// `with` must still get independent program state, so the key
+    /// belongs to the slot lookup, not just the source identity.
+    fn ops(
+        &mut self,
+        element: usize,
+        src: &str,
+        local_frame: u32,
+        with: &str,
+        w: f64,
+        h: f64,
+    ) -> Option<DrawList>;
 }
 
 /// Per-script state: load failures cache so a broken program fails once
@@ -197,15 +213,17 @@ fn warn(sink: &Option<WarnSink>, msg: String) {
     }
 }
 
-/// The real engine: each script loads once per worker, errors cache so
-/// a broken program fails once instead of once per frame. Cache key is
-/// `(src, with)` — two elements sharing a source but with different
-/// payloads get independent program state, so `setup` sees the right
-/// `d` in both.
+/// The real engine: each element instance gets its own program state,
+/// and errors cache so a broken program fails once instead of once per
+/// frame. Cache key is `(element, src, with)` — two elements sharing a
+/// source *and* payload still get independent runtimes, so a counter
+/// stashed on `d` can't leak between them. (Each slot pays for a fresh
+/// QuickJS runtime; elements are few per scene, so the isolation is
+/// worth more than sharing a compiled blob would save.)
 #[derive(Default)]
 pub struct SandboxPrograms {
     root: std::path::PathBuf,
-    programs: std::collections::HashMap<(String, String), Slot>,
+    programs: std::collections::HashMap<(usize, String, String), Slot>,
     warnings: Option<WarnSink>,
 }
 
@@ -271,9 +289,17 @@ impl SandboxPrograms {
 }
 
 impl ProgramSource for SandboxPrograms {
-    fn ops(&mut self, src: &str, local_frame: u32, with: &str, w: f64, h: f64) -> Option<DrawList> {
+    fn ops(
+        &mut self,
+        element: usize,
+        src: &str,
+        local_frame: u32,
+        with: &str,
+        w: f64,
+        h: f64,
+    ) -> Option<DrawList> {
         let warnings = self.warnings.clone();
-        let key = (src.to_string(), canonical_with(with));
+        let key = (element, src.to_string(), canonical_with(with));
         if !self.programs.contains_key(&key) {
             let slot = match self.resolve(src) {
                 Err(ResolveError::Escapes) => {
@@ -419,11 +445,11 @@ mod tests {
             DrawOp::Rect { x, .. } => *x,
             _ => panic!("rect"),
         };
-        let a = progs.ops("p.js", 0, r#"{"step":1}"#, 1.0, 1.0).unwrap();
+        let a = progs.ops(1, "p.js", 0, r#"{"step":1}"#, 1.0, 1.0).unwrap();
         assert_eq!(x(a), 2.0); // setup 1 + render 1
         // Whitespace variant hits the same slot — `d.x` continues at 3,
         // not reset to 2 by a fresh program.
-        let b = progs.ops("p.js", 1, r#"{"step": 1}"#, 1.0, 1.0).unwrap();
+        let b = progs.ops(1, "p.js", 1, r#"{"step": 1}"#, 1.0, 1.0).unwrap();
         assert_eq!(x(b), 3.0);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -441,9 +467,9 @@ mod tests {
         let sink = WarnSink::default();
         let mut progs = SandboxPrograms::new(root.clone()).with_warnings(sink.clone());
 
-        assert!(progs.ops("gone.js", 0, "{}", 10.0, 10.0).is_none());
+        assert!(progs.ops(1, "gone.js", 0, "{}", 10.0, 10.0).is_none());
         // Cached failure — the warning must not repeat per frame.
-        assert!(progs.ops("gone.js", 1, "{}", 10.0, 10.0).is_none());
+        assert!(progs.ops(1, "gone.js", 1, "{}", 10.0, 10.0).is_none());
         {
             let w = sink.lock().unwrap();
             assert_eq!(w.len(), 1, "{w:?}");
@@ -452,7 +478,7 @@ mod tests {
 
         // A real file reached through `..` reports the escape wording.
         let rel = format!("../prog-sink-out-{id}/x.js");
-        assert!(progs.ops(&rel, 0, "{}", 10.0, 10.0).is_none());
+        assert!(progs.ops(1, &rel, 0, "{}", 10.0, 10.0).is_none());
         let w = sink.lock().unwrap();
         assert!(
             w.iter().any(|m| m.contains("escapes the project root")),

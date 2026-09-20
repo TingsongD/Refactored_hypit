@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::error::{MediaError, Tool};
 use crate::probe::{MediaInfo, probe};
-use crate::proc::wait_timeout;
+use crate::proc::{spawn_grouped, wait_timeout};
 use crate::stderr::StderrDrain;
 use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
 
@@ -125,7 +125,7 @@ impl FrameStream {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| MediaError::Spawn {
+        let mut child = spawn_grouped(&mut cmd).map_err(|e| MediaError::Spawn {
             tool: "ffmpeg",
             source: e,
         })?;

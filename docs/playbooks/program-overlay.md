@@ -29,11 +29,13 @@ function render(ctx, f, d) {
 }
 ```
 
-`setup(d)` runs once per render worker — stash derived state on `d`.
+`setup(d)` runs once per element instance — stash derived state on `d`.
 `render(ctx, f, d)` runs per frame; `f` is the element-local frame
 (first live frame = 0). `d` is the `with` JSON object itself —
 `with='{"seconds": 6}'` arrives as `d.seconds`, and anything you add
-in `setup` is still there in `render`.
+in `setup` is still there in `render`. Two `<program>` elements —
+even with the same `src` and `with` — get their own `d`, so state
+never leaks between them.
 
 Ops are element-local: `(0,0)` is the element's top-left, and
 `ctx.w`/`ctx.h` report its box. A program with no `at` covers the
@@ -69,7 +71,9 @@ engine render main.scene
   per frame — precompute in `setup`.
 - **State**: `d` is the same object across `setup`/`render`, and
   `render` calls replay in frame order even when workers shard the
-  range — counters on `d` are deterministic at any worker count. Note
-  they reflect the *rendered* range: under `--frames a:b`, `f` starts
-  at the window's first frame. Prefer deriving frame-varying values
-  from `f` directly — clearer, and unaffected by the window.
+  range — counters on `d` are deterministic at any worker count. A
+  `--frames a:b` window replays the program from scene start too, so
+  `f` keeps its element-local numbering and `d` carries the same state
+  a full render would — the window only changes which frames land in
+  the video. Prefer deriving frame-varying values from `f` directly —
+  clearer, and unaffected by either sharding or windows.

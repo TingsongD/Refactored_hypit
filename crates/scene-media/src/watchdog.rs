@@ -5,9 +5,11 @@
 //! stale past `stall`, the watchdog SIGKILLs the child's pid so the
 //! blocked call returns EPIPE and the error propagates normally.
 //!
-//! Killing by pid needs a syscall — unix only (`libc`, a tiny
-//! unix-target dep). Other platforms compile the watchdog to a no-op;
-//! owner-thread deadlines (`wait_timeout`) still apply everywhere.
+//! Killing by pid needs a syscall — on unix `libc` SIGKILLs the child's
+//! process *group* (children are spawned via `spawn_grouped`, so the
+//! group covers descendants that would otherwise keep our pipes open).
+//! On Windows the kill runs `taskkill /T /F` — the same tree semantics
+//! through a tool that always ships with the OS.
 //!
 //! Safety argument for kill-by-pid: on unix a spawned child keeps its
 //! pid until reaped — even as a zombie — so while a `Child` handle is
@@ -96,12 +98,30 @@ impl Drop for StallWatchdog {
 
 #[cfg(unix)]
 fn kill_pid(pid: u32) {
-    // SIGKILL the pid we spawned. If the child already exited but wasn't
-    // reaped it's a zombie — kill reports ESRCH, harmless.
-    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    // Grouped children lead their own process group — kill the group so
+    // descendants can't outlive the stall kill holding our pipes. ESRCH
+    // on an ungrouped pid is harmless (a pgid is its leader's pid; a
+    // non-leader names no group); the direct kill covers that case and
+    // the zombie case (kill on an unreaped child is a no-op).
+    unsafe {
+        libc::killpg(pid as i32, libc::SIGKILL);
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn kill_pid(pid: u32) {
+    // taskkill /T /F — the whole tree, forced. Best-effort: if the tool
+    // or the pid is already gone the owner's blocked pipe I/O still
+    // fails as soon as the process holding it dies.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_pid(_pid: u32) {}
 
 #[cfg(test)]

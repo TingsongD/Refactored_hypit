@@ -282,3 +282,56 @@ the most common path: media `src`.
   mislabeled 2026-02-xx).
 
 Gate: fmt, clippy `-D warnings`, workspace tests — all green.
+
+## 2026-09-21 — Review round 5: output safety, duck fixes, tree kills
+
+Nine findings, all verified against code before patching — including one
+round-4 regression (`adapt` emitting `..` srcs the new confinement
+refuses).
+
+- **Renders publish atomically.** The encoder used to take the final
+  target with ffmpeg `-y`, so a mid-render failure had already truncated
+  the previous good output before cleanup ran — and the predictable
+  `*.program.wav` temp could clobber *and then delete* an unrelated user
+  file. Video now encodes to a unique sibling temp and is renamed over
+  the target only after `finish()` succeeds; the WAV mix gets its own
+  unique name. On any failure the old output survives untouched.
+- **Ducking no longer truncates music at the key's end.** The sidechain
+  key submix had no `apad` — `sidechaincompress` (a framesync filter)
+  stops when its secondary input ends, so a 3s bed under a 1s voice went
+  silent at 1s. The key submix is now padded to program length before
+  compression (gated test: `ducked_music_survives_past_the_key`).
+- **Multiple ducks can share one key.** `asplit=2` emitted a single
+  `[a{i}k]` label that every consuming link reused → `Invalid stream
+  specifier`. Each key clip now splits N+1 ways (main + one label per
+  link); gated repro `two_ducks_share_one_key` mixes clean.
+- **Timeouts kill the process tree, not just the child.** A connector
+  script's `curl` grandchild inherited our pipes, survived the parent
+  kill, and hung the drain join forever. `spawn_grouped` puts every
+  managed child in its own process group (unix) so `wait_timeout`,
+  `output_timeout`, and the stall watchdog `killpg`/`taskkill /T` the
+  whole tree — pipes reach EOF, drains finish, no zombies. The watchdog
+  is real on Windows now (`taskkill /PID /T /F`) instead of a no-op.
+- **`adapt` imports footage instead of emitting escapes.** Round-4's
+  confinement made `adapt clip.mp4 --out nested/draft.scene` produce
+  `src="../clip.mp4"` — unrenderable. With `--out`, footage outside the
+  scene's root is now copied into `assets/` (downloads move outright),
+  never clobbering an unrelated file (`name-1.ext` suffixes); sources
+  already inside are left alone.
+- **Program state is per element instance.** The sandbox cache keyed
+  `(src, with)` — two identical `<program>` elements shared one runtime
+  and their `d` state leaked together. `ops()` now takes a stable
+  element key (the resolved element's address); same src+with, different
+  elements → independent counters and `setup`.
+- **`--frames` windows replay program state from zero.** Warm-up ran
+  `range_start..shard.start`, so `--frames 90:120` skipped the state
+  built over 0–89. Now `0..shard.start` — a window pixel-matches the
+  same frames of a full run (new test proves it, 1 and 2 workers).
+- **`doctor` checks exit status and uses the right flag.** Any spawned
+  process reported "ok" — even `yt-dlp -version` exiting nonzero.
+  Version args are per-tool (`-version` for ffmpeg/ffprobe, `--version`
+  for yt-dlp/uv) and a nonzero status reports MISSING with the exit code.
+
+Gate: fmt, clippy `-D warnings`, workspace tests, `SCENE_MEDIA_TESTS=1`
+— all green, including two new FFmpeg-gated ducking regressions and the
+process-group kill tests.

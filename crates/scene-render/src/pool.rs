@@ -85,11 +85,12 @@ pub fn render_frames_into<'a>(
     // Contiguous shards, first workers get the remainder one each.
     let base = total / workers;
     let extra = total % workers;
-    let range_start = frames.start;
     // Script state is sequential: a program's `render()` may accumulate
     // across frames, so a worker that starts mid-range must first replay
     // the calls a continuous run would have made — otherwise output
-    // changes with the worker count.
+    // changes with the worker count. The replay starts at frame *zero*,
+    // not the window's start: a `--frames 90:120` window still carries
+    // the state built over 0..90 (layout-only, no pixels).
     let has_programs = scene_has_programs(scene);
 
     // Cancellation has two halves: the flag makes workers stop *starting*
@@ -121,7 +122,7 @@ pub fn render_frames_into<'a>(
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut renderer = make_renderer(scene, timings);
                     if has_programs && !cancel.load(Ordering::Relaxed) {
-                        renderer.warm_programs(range_start..shard.start);
+                        renderer.warm_programs(0..shard.start);
                     }
                     for index in shard {
                         if cancel.load(Ordering::Relaxed) {
@@ -443,6 +444,7 @@ mod tests {
     impl scene_script::ProgramSource for FixedPrograms {
         fn ops(
             &mut self,
+            _element: usize,
             _src: &str,
             local_frame: u32,
             _with: &str,
@@ -502,6 +504,7 @@ mod tests {
     impl scene_script::ProgramSource for CountingPrograms {
         fn ops(
             &mut self,
+            _element: usize,
             _src: &str,
             _local_frame: u32,
             _with: &str,
@@ -544,6 +547,52 @@ mod tests {
             one, four,
             "stateful program output must not depend on worker count"
         );
+    }
+
+    /// The review finding: `--frames 20:40` used to warm from *frame 20*,
+    /// so a stateful program's window output skipped the state built over
+    /// 0..20. The window must pixel-match the same frames of a full run.
+    #[test]
+    fn frame_windows_match_the_full_run_for_stateful_programs() {
+        let mut scene = test_scene();
+        scene.tracks[0].elements.push(ResolvedElement {
+            id: None,
+            kind: ElementKind::Program {
+                src: "counter.js".into(),
+                with: None,
+            },
+            timing: timing(0, 90),
+            placement: None,
+            anim: None,
+            children: Vec::new(),
+            span: Span::new(0, 0),
+        });
+        let timings = TimingMap::default();
+        fn counting<'a>(scene: &'a ResolvedScene, timings: &'a TimingMap) -> Renderer<'a> {
+            let mut r = renderer(scene, timings);
+            r.programs = Box::new(CountingPrograms { calls: 0 });
+            r
+        }
+        let full = render_frames(&scene, &timings, 0..40, 1, &counting).unwrap();
+        // One worker *and* sharded — the prefix replay must land either way.
+        let window_one = render_frames(&scene, &timings, 20..40, 1, &counting).unwrap();
+        let window_two = render_frames(&scene, &timings, 20..40, 2, &counting).unwrap();
+        for (i, w) in window_one.iter().enumerate() {
+            assert_eq!(
+                *w,
+                full[20 + i],
+                "window frame {} differs from the full run",
+                w.index
+            );
+        }
+        for (i, w) in window_two.iter().enumerate() {
+            assert_eq!(
+                *w,
+                full[20 + i],
+                "sharded window frame {} differs from the full run",
+                w.index
+            );
+        }
     }
 
     /// Half-transparent red — straight alpha, the shape frame sources
@@ -729,6 +778,7 @@ mod tests {
     impl scene_script::ProgramSource for ExplodingPrograms {
         fn ops(
             &mut self,
+            _element: usize,
             _src: &str,
             local_frame: u32,
             _with: &str,

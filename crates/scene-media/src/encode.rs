@@ -13,7 +13,7 @@ use std::time::Duration;
 use scene_ir::Rational;
 
 use crate::error::{MediaError, Tool};
-use crate::proc::wait_timeout;
+use crate::proc::{spawn_grouped, wait_timeout};
 use crate::stderr::StderrDrain;
 use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
 
@@ -87,16 +87,15 @@ impl Encoder {
             )));
         }
         let tool = std::env::var("FFMPEG").unwrap_or_else(|_| Tool::Ffmpeg.name().to_string());
-        let mut child = Command::new(&tool)
-            .args(encode_args(out, w, h, fps, audio))
+        let mut cmd = Command::new(&tool);
+        cmd.args(encode_args(out, w, h, fps, audio))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| MediaError::Spawn {
-                tool: "ffmpeg",
-                source: e,
-            })?;
+            .stderr(Stdio::piped());
+        let mut child = spawn_grouped(&mut cmd).map_err(|e| MediaError::Spawn {
+            tool: "ffmpeg",
+            source: e,
+        })?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
         let heartbeat = heartbeat();

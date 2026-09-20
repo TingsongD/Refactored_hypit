@@ -418,9 +418,18 @@ mod tests {
             program_samples: 6 * PROGRAM_RATE,
         };
         let fc = filter_complex(&graph);
-        // Key clip splits: one branch to mix, one to the key submix.
-        assert!(fc.contains("asplit=2[a1m][a1k]"), "{fc}");
-        assert!(fc.contains("[a1k]amix=inputs=1:normalize=0[key0]"), "{fc}");
+        // Key clip splits: one branch to mix, one key label per link.
+        assert!(fc.contains("asplit=2[a1m][a1k0]"), "{fc}");
+        // The key submix is padded to program length — without it the
+        // compressor's key input ends early and truncates the music.
+        assert!(
+            fc.contains("[a1k0]amix=inputs=1:normalize=0[key0raw]"),
+            "{fc}"
+        );
+        assert!(
+            fc.contains("[key0raw]apad=whole_dur=6.000000[key0]"),
+            "{fc}"
+        );
         assert!(
             fc.contains("[a0][key0]sidechaincompress=threshold=0.020000:ratio=8.000000"),
             "{fc}"
@@ -430,6 +439,57 @@ mod tests {
             fc.contains("[duck0][a1m]amix=inputs=2:normalize=0,apad=whole_dur=6.000000[aout]"),
             "{fc}"
         );
+    }
+
+    #[test]
+    fn two_ducks_sharing_one_key_get_distinct_labels() {
+        // Two music beds duck under the same voice — the key clip needs
+        // three splits (main + one per link); reusing a label breaks
+        // ffmpeg with "Invalid stream specifier".
+        let clip = |src: &str, track: &str| AudioClip {
+            src: PathBuf::from(src),
+            target: SampleRange {
+                start: 0,
+                end: 6 * PROGRAM_RATE,
+            },
+            src_start_s: 0.0,
+            gain_db: 0.0,
+            fade: Fade::default(),
+            track_id: track.into(),
+            span: Span::new(0, 0),
+        };
+        let graph = AudioGraph {
+            clips: vec![
+                clip("/p/bed1.mp3", "music"),
+                clip("/p/vo.wav", "voice"),
+                clip("/p/bed2.mp3", "music"),
+            ],
+            duck: vec![
+                DuckLink {
+                    clip: 0,
+                    key: vec![1],
+                },
+                DuckLink {
+                    clip: 2,
+                    key: vec![1],
+                },
+            ],
+            program_samples: 6 * PROGRAM_RATE,
+        };
+        let fc = filter_complex(&graph);
+        // Clip 1 splits three ways; each link consumes its own label.
+        assert!(fc.contains("asplit=3[a1m][a1k0][a1k1]"), "{fc}");
+        assert!(
+            fc.contains("[a1k0]amix=inputs=1:normalize=0[key0raw]"),
+            "{fc}"
+        );
+        assert!(
+            fc.contains("[a1k1]amix=inputs=1:normalize=0[key1raw]"),
+            "{fc}"
+        );
+        assert!(fc.contains("[a0][key0]sidechaincompress"), "{fc}");
+        assert!(fc.contains("[a2][key1]sidechaincompress"), "{fc}");
+        assert!(fc.contains("[duck0][a1m][duck1]amix=inputs=3"), "{fc}");
     }
 
     #[test]

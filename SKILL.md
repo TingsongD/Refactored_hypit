@@ -106,8 +106,11 @@ fill color. Malformed ops are dropped, never fatal.
 
 `render` is called once per frame in order — state accumulated on `d`
 is deterministic at any worker count (shard prefixes replay before a
-worker starts mid-range). Under `--frames a:b`, `f` and `d` see the
-window only, not the full program.
+worker starts mid-range). `d` is per *element instance*: two programs
+with the same `src` and `with` get independent runtimes. Under
+`--frames a:b` the program still replays from scene start, so `f`/`d`
+carry the same values a full render would — the window only changes
+which frames are emitted.
 
 ## Adapt (existing footage → draft scene)
 
@@ -118,7 +121,9 @@ engine adapt clip.mp4 --out main.scene        # or a URL via yt-dlp
 Probes the file, detects hard cuts (robust frame-diff), and emits a
 draft: full-span clip + one labeled board per shot + music track when
 the source has audio. It always parses clean — it's a starting point
-you edit, not a finished edit.
+you edit, not a finished edit. With `--out`, footage outside the draft's
+project root is copied into its `assets/` first, so the emitted `src`
+always resolves inside the scene (a downloaded URL moves, not copies).
 
 ## Capabilities (external asset generation)
 
