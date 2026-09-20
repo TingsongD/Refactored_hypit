@@ -179,6 +179,24 @@ enum Slot {
     },
 }
 
+/// Shared per-render warning log — the same concrete type as
+/// `scene_render::WarnSink`; scene-script can't name that alias without
+/// a dependency cycle (scene-render depends on this crate), so it takes
+/// `Arc<Mutex<BTreeSet<String>>>` directly. `None` keeps the standalone
+/// `eprintln!` behavior for callers with no sink to feed.
+pub type WarnSink = std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
+
+fn warn(sink: &Option<WarnSink>, msg: String) {
+    match sink {
+        Some(s) => {
+            if let Ok(mut w) = s.lock() {
+                w.insert(msg);
+            }
+        }
+        None => eprintln!("warning: {msg}"),
+    }
+}
+
 /// The real engine: each script loads once per worker, errors cache so
 /// a broken program fails once instead of once per frame. Cache key is
 /// `(src, with)` — two elements sharing a source but with different
@@ -188,6 +206,7 @@ enum Slot {
 pub struct SandboxPrograms {
     root: std::path::PathBuf,
     programs: std::collections::HashMap<(String, String), Slot>,
+    warnings: Option<WarnSink>,
 }
 
 /// Why a `src` couldn't be used — "escapes the root" and "isn't there"
@@ -218,7 +237,16 @@ impl SandboxPrograms {
         SandboxPrograms {
             root,
             programs: std::collections::HashMap::new(),
+            warnings: None,
         }
+    }
+
+    /// Record program failures into `sink` so a missing/refused/broken
+    /// script reaches the diagnostic report — same contract the media
+    /// sources use (`with_warnings` on the frame sources).
+    pub fn with_warnings(mut self, sink: WarnSink) -> Self {
+        self.warnings = Some(sink);
+        self
     }
 
     /// Resolve `src` under `root`, refusing anything that escapes —
@@ -244,15 +272,19 @@ impl SandboxPrograms {
 
 impl ProgramSource for SandboxPrograms {
     fn ops(&mut self, src: &str, local_frame: u32, with: &str, w: f64, h: f64) -> Option<DrawList> {
+        let warnings = self.warnings.clone();
         let key = (src.to_string(), canonical_with(with));
         if !self.programs.contains_key(&key) {
             let slot = match self.resolve(src) {
                 Err(ResolveError::Escapes) => {
-                    eprintln!("warning: program `{src}` escapes the project root — refused");
+                    warn(
+                        &warnings,
+                        format!("program `{src}` escapes the project root — refused"),
+                    );
                     Slot::Failed
                 }
                 Err(ResolveError::Missing) => {
-                    eprintln!("warning: program `{src}` not found");
+                    warn(&warnings, format!("program `{src}` not found"));
                     Slot::Failed
                 }
                 Ok(path) => std::fs::read_to_string(&path)
@@ -264,7 +296,7 @@ impl ProgramSource for SandboxPrograms {
                         warned_drops: false,
                     })
                     .unwrap_or_else(|| {
-                        eprintln!("warning: program `{src}` failed to load");
+                        warn(&warnings, format!("program `{src}` failed to load"));
                         Slot::Failed
                     }),
             };
@@ -283,14 +315,17 @@ impl ProgramSource for SandboxPrograms {
             Ok((list, dropped)) => {
                 if dropped > 0 && !*warned_drops {
                     *warned_drops = true;
-                    eprintln!("warning: program `{src}` dropped {dropped} malformed op(s)");
+                    warn(
+                        &warnings,
+                        format!("program `{src}` dropped {dropped} malformed op(s)"),
+                    );
                 }
                 Some(list)
             }
             Err(e) => {
                 if !*warned_eval {
                     *warned_eval = true;
-                    eprintln!("warning: program `{src}` render failed: {e}");
+                    warn(&warnings, format!("program `{src}` render failed: {e}"));
                 }
                 None
             }
@@ -391,5 +426,39 @@ mod tests {
         let b = progs.ops("p.js", 1, r#"{"step": 1}"#, 1.0, 1.0).unwrap();
         assert_eq!(x(b), 3.0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn program_failures_reach_the_sink_once() {
+        let id = std::process::id();
+        // Unique dir names — other tests in this process already own
+        // `prog-out-{id}` and share the same temp namespace.
+        let root = std::env::temp_dir().join(format!("prog-sink-{id}"));
+        let outside = std::env::temp_dir().join(format!("prog-sink-out-{id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("x.js"), "function render(){}").unwrap();
+        let sink = WarnSink::default();
+        let mut progs = SandboxPrograms::new(root.clone()).with_warnings(sink.clone());
+
+        assert!(progs.ops("gone.js", 0, "{}", 10.0, 10.0).is_none());
+        // Cached failure — the warning must not repeat per frame.
+        assert!(progs.ops("gone.js", 1, "{}", 10.0, 10.0).is_none());
+        {
+            let w = sink.lock().unwrap();
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(w.iter().next().unwrap().contains("gone.js"));
+        }
+
+        // A real file reached through `..` reports the escape wording.
+        let rel = format!("../prog-sink-out-{id}/x.js");
+        assert!(progs.ops(&rel, 0, "{}", 10.0, 10.0).is_none());
+        let w = sink.lock().unwrap();
+        assert!(
+            w.iter().any(|m| m.contains("escapes the project root")),
+            "{w:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

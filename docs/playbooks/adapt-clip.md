@@ -55,8 +55,9 @@ The `Shot N` placeholders are where your content goes:
   property today.
 - Soft cuts and dissolves don't register — only hard boundaries.
   Add boards by hand where the content actually turns.
-- The music element keeps the source's own audio; mute it with
-  `gain="-inf"` (or delete the audio track) if you're laying new voice.
+- The music element keeps the source's own audio; effectively mute it
+  with `gain="-60dB"` (or delete the audio track) if you're laying new
+  voice. Gains must be finite — `inf`/`nan` are rejected.
 
 ## What to check
 

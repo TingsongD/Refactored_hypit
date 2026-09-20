@@ -7,9 +7,10 @@ mp4. Rewrite a line and the composition re-times itself.
 Status: **all 12 modules complete** — markup → IR → timing → layout →
 raster → audio → mux, plus alignment, capabilities, sandboxed `<program>`
 scripts, `adapt` ingestion, and the localhost test UI. See `DESIGN.md`
-for architecture and the per-module gates; `SKILL.md` for the authoring
-reference; `docs/playbooks/` for worked examples; `DEV_LOG.md` for the
-change history.
+for architecture and the per-module gates; `USER_GUIDE.md` for the
+end-to-end walkthrough; `SKILL.md` for the authoring reference;
+`docs/playbooks/` for worked examples; `DEV_LOG.md` for the change
+history.
 
 ## Install
 

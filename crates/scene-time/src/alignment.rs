@@ -51,6 +51,34 @@ impl TimingSource {
             .fold(0.0, f64::max)
     }
 
+    /// Words a bad connector or a hand-written `--timings` file can
+    /// carry: JSON keeps non-finite values out, but negative times and
+    /// reversed (`end < start`) spans parse fine and would produce
+    /// subtly wrong captions and lattice points. Reports, keeps — the
+    /// data is suspect, not unreadable.
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in &self.lines {
+            let bad = line
+                .words
+                .iter()
+                .filter(|w| {
+                    !w.start_s.is_finite()
+                        || !w.end_s.is_finite()
+                        || w.start_s < 0.0
+                        || w.end_s < w.start_s
+                })
+                .count();
+            if bad > 0 {
+                out.push(format!(
+                    "cue `{}` has {bad} word(s) with invalid times",
+                    line.cue
+                ));
+            }
+        }
+        out
+    }
+
     /// Sorted word-start positions plus the final word end — the lattice
     /// that `±Nw` offsets move along. Crossing cue boundaries is intended:
     /// `hook+2w` two words past a one-word line lands in the next line.

@@ -3,8 +3,14 @@
 //! the engine uses — spawned, stderr-captured, status-checked).
 
 use crate::AdaptError;
+use scene_media::output_timeout;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
+
+/// Downloads are legitimately slow — the deadline exists for a wedged
+/// yt-dlp, not a big file. Fifteen minutes is a hang, not a download.
+const INGEST_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// A local media file ready for [`crate::analyze`].
 #[derive(Debug)]
@@ -39,8 +45,8 @@ pub fn ingest(source: &str, out_dir: &Path) -> Result<Ingested, AdaptError> {
     // yt-dlp picks the extension; `-o` is a template, `--print` tells us
     // the real filename it wrote.
     let template = out_dir.join("adapt-source.%(ext)s");
-    let output = Command::new("yt-dlp")
-        .args([
+    let output = output_timeout(
+        Command::new("yt-dlp").args([
             "-f",
             "best[ext=mp4]/best",
             "--no-playlist",
@@ -49,12 +55,11 @@ pub fn ingest(source: &str, out_dir: &Path) -> Result<Ingested, AdaptError> {
             "--print",
             "after_move:filepath",
             source,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| AdaptError::Ingest(format!("could not run yt-dlp: {e}")))?;
+        ]),
+        "yt-dlp",
+        INGEST_TIMEOUT,
+    )
+    .map_err(|e| AdaptError::Ingest(format!("yt-dlp failed: {e}")))?;
 
     if !output.status.success() {
         return Err(AdaptError::Ingest(format!(

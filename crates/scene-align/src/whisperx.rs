@@ -88,7 +88,11 @@ pub fn whisperx_to_timing(
             None,
         ));
     }
-    Ok((TimingSource { lines }, diags))
+    let source = TimingSource { lines };
+    for msg in source.validate() {
+        diags.push(Diagnostic::warning(msg, None));
+    }
+    Ok((source, diags))
 }
 
 /// Wrap a `TimingSource` in the `TimingMap` shape `engine render

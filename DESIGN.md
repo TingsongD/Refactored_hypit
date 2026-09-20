@@ -88,6 +88,24 @@ Facts a change must preserve — each is pinned by a test:
   containment rejects symlink escapes; malformed percent-encoding and
   inverted ranges return 4xx/200, never panic.
 - **A worker panic is an `Err`, not a dead process.**
+- **Markup depth is bounded at the parser.** `parse_node` caps at 128
+  levels; every downstream pass (lower, resolve, layout, raster) walks
+  the same tree, so one bound covers them all.
+- **Authored paths stay inside the project root.** `src` attributes
+  resolve through canonicalized confinement in the sandbox and warn in
+  lowering; `<render target>` gets the same treatment at render time —
+  lexical `..` normalization plus canonicalization of the deepest
+  existing ancestor, so symlinks inside the root can't tunnel out.
+  `--out` is the operator's argument and is used verbatim.
+- **Every subprocess has a deadline.** `proc::wait_timeout` /
+  `output_timeout` kill+reap past a limit on all wait/output call sites.
+  Streaming decode/encode can't use a wait deadline (a blocked pipe
+  `read`/`write` can't rescue itself), so they arm a `StallWatchdog`:
+  heartbeat per successful I/O, SIGKILL by pid on unix when it goes
+  stale, fixed deadlines on EOF reap and muxer teardown.
+- **Asset and program failures report through `WarnSink`.** Media
+  sources and `SandboxPrograms` share one `BTreeSet` sink — dedup for
+  free, surfaced in the render diagnostics bundle and the UI.
 - **Frames stream through bounded per-shard channels.** Each worker
   pushes rendered frames into its own `sync_channel(SHARD_QUEUE)`; the
   caller drains shards in index order — disjoint contiguous ranges make

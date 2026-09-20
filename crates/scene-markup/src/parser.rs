@@ -6,13 +6,19 @@ use scene_ir::{Diagnostic, Span};
 
 use crate::raw::{RawAttr, RawChild, RawNode};
 
+/// Deepest element nesting accepted. Real scenes nest a handful of
+/// levels; the cap exists because every stage below the parser
+/// (lowering, resolution, layout, raster) recurses over this depth —
+/// uncapped input is a stack-overflow crash, not a diagnostic.
+const MAX_DEPTH: usize = 128;
+
 /// Parse a whole document; on syntax failure returns one fatal diagnostic.
 /// Recovery past a syntax error is a known limitation — the first malformed
 /// position is reported precisely rather than guessing at structure.
 pub fn parse_document(src: &str) -> Result<RawNode, Diagnostic> {
     let mut p = Parser { src, pos: 0 };
     p.skip_misc()?;
-    let node = p.parse_node()?;
+    let node = p.parse_node(0)?;
     p.skip_misc()?;
     if !p.eof() {
         return Err(p.err_at(p.pos, "unexpected content after the root element"));
@@ -116,8 +122,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_node(&mut self) -> Result<RawNode, Diagnostic> {
+    fn parse_node(&mut self, depth: usize) -> Result<RawNode, Diagnostic> {
         let start = self.pos;
+        if depth >= MAX_DEPTH {
+            return Err(self.err_at(
+                start,
+                format!("document nested too deeply (max {MAX_DEPTH} levels)"),
+            ));
+        }
         if !self.starts_with("<") {
             return Err(self.err_at(start, "expected `<`"));
         }
@@ -208,7 +220,7 @@ impl<'a> Parser<'a> {
                 });
             }
             if self.starts_with("<") {
-                children.push(RawChild::Node(self.parse_node()?));
+                children.push(RawChild::Node(self.parse_node(depth + 1)?));
                 continue;
             }
             // Text run up to the next `<`.
@@ -333,5 +345,19 @@ mod tests {
         let span = err.span.unwrap();
         // The span covers the mismatched `</b` close tag.
         assert_eq!(span.start, 3);
+    }
+
+    #[test]
+    fn nesting_beyond_the_cap_is_a_diagnostic_not_a_crash() {
+        let deep = format!(
+            "{}{}",
+            "<a>".repeat(MAX_DEPTH + 10),
+            "</a>".repeat(MAX_DEPTH + 10)
+        );
+        let err = parse(&deep).unwrap_err();
+        assert!(err.message.contains("nested too deeply"), "{err:?}");
+        // At the cap the document is still legal.
+        let ok = format!("{}{}", "<a>".repeat(MAX_DEPTH), "</a>".repeat(MAX_DEPTH));
+        assert!(parse(&ok).is_ok());
     }
 }

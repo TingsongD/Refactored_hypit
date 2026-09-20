@@ -10,7 +10,7 @@ mod ops;
 mod sandbox;
 
 pub use ops::{DrawList, DrawOp};
-pub use sandbox::{NullPrograms, Program, ProgramSource, SandboxPrograms, ScriptError};
+pub use sandbox::{NullPrograms, Program, ProgramSource, SandboxPrograms, ScriptError, WarnSink};
 
 #[cfg(test)]
 mod tests {

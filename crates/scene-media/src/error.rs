@@ -44,6 +44,12 @@ pub enum MediaError {
     #[error("unexpected end of stream: expected {expected} bytes, got {got}")]
     ShortFrame { expected: usize, got: usize },
 
+    #[error("{tool} did not finish within {limit:?} — killed")]
+    TimedOut {
+        tool: &'static str,
+        limit: std::time::Duration,
+    },
+
     #[error(transparent)]
     Io(#[from] io::Error),
 }

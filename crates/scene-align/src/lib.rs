@@ -135,6 +135,28 @@ mod tests {
         assert!(source.line("payoff").unwrap().words.is_empty());
     }
 
+    #[test]
+    fn whisperx_invalid_word_times_warn_but_keep_the_words() {
+        // Negative and reversed spans parse fine from JSON — they must
+        // surface as warnings, not ride silently into the lattice.
+        let json = r#"{"segments":[
+            {"words":[
+                {"word":"ok","start":0.0,"end":0.2},
+                {"word":"neg","start":-0.5,"end":0.1},
+                {"word":"rev","start":0.9,"end":0.4}
+            ]},
+            {"words":[{"word":"clean","start":1.0,"end":1.5}]}
+        ]}"#;
+        let (source, diags) = whisperx_to_timing(json, &script()).unwrap();
+        assert_eq!(source.line("hook").unwrap().words.len(), 3);
+        assert!(
+            diags.iter().any(|d| !d.is_error()
+                && d.message.contains("hook")
+                && d.message.contains("invalid times")),
+            "{diags:?}"
+        );
+    }
+
     /// The M7 gate's whole point: connector output drives `realize`
     /// exactly like authored timing data — same lattice, same frames.
     #[test]

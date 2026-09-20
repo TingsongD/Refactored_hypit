@@ -4,7 +4,8 @@
 //! subprocess wrapper is thin.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use scene_ir::Rational;
 use serde::Deserialize;
@@ -144,25 +145,27 @@ pub fn parse_probe_json(json: &str) -> Result<MediaInfo, MediaError> {
     })
 }
 
+/// ffprobe is a local metadata read — seconds, never minutes. Anything
+/// past this is a wedged process, not a slow one.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run `ffprobe` on a file. Requires ffprobe on PATH (or `FFPROBE` env).
 pub fn probe(path: &Path) -> Result<MediaInfo, MediaError> {
     let tool = std::env::var("FFPROBE").unwrap_or_else(|_| Tool::Ffprobe.name().to_string());
-    let output = Command::new(&tool)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| MediaError::Spawn {
-            tool: "ffprobe",
-            source: e,
-        })?;
+    let output = crate::proc::output_timeout(
+        Command::new(&tool)
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+            ])
+            .arg(path),
+        "ffprobe",
+        PROBE_TIMEOUT,
+    )?;
     if !output.status.success() {
         return Err(MediaError::Failed {
             tool: "ffprobe",

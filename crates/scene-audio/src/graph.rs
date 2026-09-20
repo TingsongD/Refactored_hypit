@@ -65,10 +65,17 @@ impl AudioGraph {
     pub fn from_scene(scene: &ResolvedScene, root: &Path) -> (Self, Vec<Diagnostic>) {
         let mut clips = Vec::new();
         let mut ducks: Vec<(usize, String, Span)> = Vec::new();
-        for track in &scene.tracks {
-            collect(&track.elements, &track.id, root, &mut clips, &mut ducks);
-        }
         let mut diags = Vec::new();
+        for track in &scene.tracks {
+            collect(
+                &track.elements,
+                &track.id,
+                root,
+                &mut clips,
+                &mut ducks,
+                &mut diags,
+            );
+        }
         let mut links = Vec::new();
         for (clip, target_track, span) in ducks {
             let key: Vec<usize> = clips
@@ -149,18 +156,32 @@ fn collect(
     root: &Path,
     clips: &mut Vec<AudioClip>,
     ducks: &mut Vec<(usize, String, Span)>,
+    diags: &mut Vec<Diagnostic>,
 ) {
     for el in elements {
         let (src, gain_db, duck) = match &el.kind {
             ElementKind::Music { src, gain_db, duck } => (src.as_str(), *gain_db, duck.as_deref()),
             ElementKind::Sound { src, gain_db } => (src.as_str(), *gain_db, None),
             _ => {
-                collect(&el.children, track_id, root, clips, ducks);
+                collect(&el.children, track_id, root, clips, ducks, diags);
+                continue;
+            }
+        };
+        // Authored src stays inside the project root — same contract as
+        // visual sources and `<render target>`. An escape drops the clip
+        // with a warning rather than failing the whole mix.
+        let src = match scene_media::confine_under_root(root, Path::new(src)) {
+            Ok(path) => path,
+            Err(_) => {
+                diags.push(Diagnostic::warning(
+                    format!("audio src `{src}` escapes the project root — clip skipped"),
+                    Some(el.span),
+                ));
                 continue;
             }
         };
         clips.push(AudioClip {
-            src: root.join(src),
+            src,
             target: el.timing.samples,
             src_start_s: 0.0,
             gain_db,

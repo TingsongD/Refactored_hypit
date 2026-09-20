@@ -5,10 +5,21 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::time::Duration;
 
 use crate::error::{MediaError, Tool};
 use crate::probe::{MediaInfo, probe};
+use crate::proc::wait_timeout;
 use crate::stderr::StderrDrain;
+use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
+
+/// Decode reads are local-file I/O — five minutes without a byte is a
+/// wedged decoder, not slow media. The watchdog kills the child so the
+/// blocked `read` returns instead of holding a frame forever.
+const STALL_LIMIT: Duration = Duration::from_secs(300);
+/// Reaping a finished child is instant; thirty seconds covers a wedged
+/// post-exit teardown.
+const REAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One decoded frame, RGBA8, row-major, tightly packed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +46,10 @@ pub struct FrameStream {
     /// stderr drains on a thread so a chatty decoder can't fill the pipe
     /// and deadlock against our stdout reads.
     stderr: StderrDrain,
+    /// Updated on every successful pipe read; the watchdog kills the
+    /// child if it goes stale — a blocked `read` can't rescue itself.
+    heartbeat: Heartbeat,
+    watchdog: StallWatchdog,
     info: MediaInfo,
     width: u32,
     height: u32,
@@ -116,10 +131,14 @@ impl FrameStream {
         })?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
+        let heartbeat = heartbeat();
+        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), STALL_LIMIT);
         Ok(FrameStream {
             child,
             stdout,
             stderr,
+            heartbeat,
+            watchdog,
             info: info.clone(),
             width,
             height,
@@ -150,7 +169,10 @@ impl FrameStream {
         while read < buf.len() {
             match self.stdout.read(&mut buf[read..]) {
                 Ok(0) => break,
-                Ok(n) => read += n,
+                Ok(n) => {
+                    read += n;
+                    beat(&self.heartbeat);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
             }
@@ -176,18 +198,20 @@ impl Iterator for FrameStream {
                 Some(Ok(frame))
             }
             Ok(0) => {
-                // Clean EOF at a frame boundary. Block until the child
-                // exits to inspect the real status — try_wait races with
-                // process reaping and a crashed decoder that emitted
-                // nothing is an error, not EOF.
-                match self.child.wait() {
+                // Clean EOF at a frame boundary. Disarm first — once the
+                // child is reaped its pid can be recycled, and a still-
+                // armed watchdog ticking could kill a stranger. The reap
+                // deadline is wait_timeout's own kill path.
+                self.watchdog.disarm();
+                let status = wait_timeout(&mut self.child, "ffmpeg", REAP_TIMEOUT);
+                match status {
                     Ok(status) if status.success() => None,
                     Ok(status) => Some(Err(MediaError::Failed {
                         tool: "ffmpeg",
                         status: status.to_string(),
                         stderr: self.stderr_tail(),
                     })),
-                    Err(e) => Some(Err(e.into())),
+                    Err(e) => Some(Err(e)),
                 }
             }
             Ok(got) => Some(Err(MediaError::ShortFrame {
@@ -201,6 +225,9 @@ impl Iterator for FrameStream {
 
 impl Drop for FrameStream {
     fn drop(&mut self) {
+        // Owner is back in control — the watchdog must not race our own
+        // kill-and-reap.
+        self.watchdog.disarm();
         // Closing stdout already signals EOF; kill only if still alive,
         // then reap so no zombie remains.
         if matches!(self.child.try_wait(), Ok(None)) {

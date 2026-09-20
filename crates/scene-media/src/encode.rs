@@ -8,11 +8,22 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::time::Duration;
 
 use scene_ir::Rational;
 
 use crate::error::{MediaError, Tool};
+use crate::proc::wait_timeout;
 use crate::stderr::StderrDrain;
+use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
+
+/// Two minutes without a successful stdin write is a wedged encoder —
+/// the watchdog kills it so `write_frame` returns EPIPE instead of
+/// blocking forever. Encoding real frames beats constantly.
+const STALL_LIMIT: Duration = Duration::from_secs(120);
+/// After stdin closes, muxer teardown (moov atom, faststart rewrite)
+/// gets a fixed deadline — no heartbeats are expected during it.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One-way encode of an NV12 program stream to H.264/mp4.
 ///
@@ -24,6 +35,10 @@ pub struct Encoder {
     /// stderr drains on a thread so a chatty encoder can't fill the pipe
     /// and deadlock against our stdin writes.
     stderr: StderrDrain,
+    /// Updated on every successful frame write; the watchdog kills the
+    /// child if it goes stale — a blocked `write` can't rescue itself.
+    heartbeat: Heartbeat,
+    watchdog: StallWatchdog,
     finished: bool,
 }
 
@@ -84,10 +99,14 @@ impl Encoder {
             })?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
+        let heartbeat = heartbeat();
+        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), STALL_LIMIT);
         Ok(Encoder {
             child,
             stdin: Some(stdin),
             stderr,
+            heartbeat,
+            watchdog,
             finished: false,
         })
     }
@@ -99,20 +118,28 @@ impl Encoder {
                 "encoder stdin already closed".to_string(),
             ));
         };
-        stdin.write_all(nv12).map_err(|e| {
-            // EPIPE means ffmpeg died — report its status, not just the pipe.
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
+        match stdin.write_all(nv12) {
+            Ok(()) => {
+                beat(&self.heartbeat);
+                Ok(())
+            }
+            Err(e) => Err(if e.kind() == std::io::ErrorKind::BrokenPipe {
+                // EPIPE means ffmpeg died — report its status, not just
+                // the pipe.
                 self.child_failed()
             } else {
                 MediaError::Io(e)
-            }
-        })
+            }),
+        }
     }
 
     /// Close stdin, wait for muxer teardown, report failures.
     pub fn finish(&mut self) -> Result<(), MediaError> {
         drop(self.stdin.take());
-        let status = self.child.wait()?;
+        // No more writes — the heartbeat would go stale during a legit
+        // mux. Disarm the stall check; teardown gets a fixed deadline.
+        self.watchdog.disarm();
+        let status = wait_timeout(&mut self.child, "ffmpeg", FINISH_TIMEOUT)?;
         self.finished = true;
         if !status.success() {
             return Err(self.failed_status(status));
@@ -151,6 +178,7 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
+        self.watchdog.disarm();
         if self.finished {
             return;
         }
@@ -292,10 +320,15 @@ mod tests {
         // stdin path on a value constructed by hand.
         let (reader, writer) = std::io::pipe().unwrap();
         drop(writer); // EOF — the drain thread exits, so Drop::join returns
+        let child = Command::new("true").spawn().unwrap();
+        let heartbeat = heartbeat();
+        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), Duration::from_secs(3600));
         let mut enc = Encoder {
-            child: Command::new("true").spawn().unwrap(),
+            child,
             stdin: None,
             stderr: StderrDrain::start(reader),
+            heartbeat,
+            watchdog,
             finished: false, // Drop waits on the child — no zombie
         };
         assert!(enc.write_frame(&[0]).is_err());

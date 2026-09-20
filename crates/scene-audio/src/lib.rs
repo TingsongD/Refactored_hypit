@@ -167,6 +167,57 @@ mod tests {
     }
 
     #[test]
+    fn escaping_audio_src_warns_and_skips_the_clip() {
+        // `<sound src="../outside.wav">` is markup reaching outside the
+        // project root — the clip drops with a warning, the mix lives.
+        let rel = scene(
+            vec![track(
+                "voice",
+                vec![
+                    audio_el(
+                        ElementKind::Sound {
+                            src: "../outside.wav".into(),
+                            gain_db: 0.0,
+                        },
+                        timing(0, 4),
+                    ),
+                    audio_el(
+                        ElementKind::Sound {
+                            src: "inside.wav".into(),
+                            gain_db: 0.0,
+                        },
+                        timing(0, 4),
+                    ),
+                ],
+            )],
+            4,
+        );
+        let (graph, diags) = AudioGraph::from_scene(&rel, Path::new("/proj"));
+        assert_eq!(graph.clips.len(), 1);
+        assert!(graph.clips[0].src.ends_with("inside.wav"));
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("escapes the project root"));
+        // Absolute paths outside the root are refused the same way.
+        let abs = scene(
+            vec![track(
+                "voice",
+                vec![audio_el(
+                    ElementKind::Music {
+                        src: "/etc/passwd".into(),
+                        gain_db: 0.0,
+                        duck: None,
+                    },
+                    timing(0, 4),
+                )],
+            )],
+            4,
+        );
+        let (graph, diags) = AudioGraph::from_scene(&abs, Path::new("/proj"));
+        assert!(graph.clips.is_empty());
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
     fn gain_and_delay_math() {
         assert!((gain_linear(0.0) - 1.0).abs() < 1e-9);
         assert!((gain_linear(-6.0) - 0.501187).abs() < 1e-5);

@@ -377,12 +377,24 @@ pub fn render_inner(
     // Stale-timing guard: `engine align` stamps the script fingerprint
     // into the timing document — if it doesn't match the live script,
     // the words were aligned against different text and captions would
-    // show the old words without a word of complaint.
-    if let Some(d) = stale_timing_warning(&scene, &timings) {
+    // show the old words without a word of complaint. Same bundle carries
+    // word-time validation — a hand-edited or connector-produced file can
+    // carry negative or reversed spans that parse fine but caption wrong.
+    let mut timing_diags: Vec<Diagnostic> =
+        stale_timing_warning(&scene, &timings).into_iter().collect();
+    for source in timings.sources.values() {
+        timing_diags.extend(
+            source
+                .validate()
+                .into_iter()
+                .map(|m| Diagnostic::warning(m, None)),
+        );
+    }
+    if !timing_diags.is_empty() {
         bundles.push(DiagBundle {
             name: name.clone(),
             source: source.clone(),
-            diags: vec![d],
+            diags: timing_diags,
         });
     }
 
@@ -410,14 +422,26 @@ pub fn render_inner(
         None => resolved.program.frames.start..resolved.program.frames.end,
     };
 
-    let target = match out.or_else(|| resolved_tracks_target(&scene)) {
+    let project_root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    // `<render target>` is authored markup, so it resolves against the
+    // project root and may not escape it — an `../`/absolute target would
+    // let a scene create dirs and `-y`-truncate files anywhere ffmpeg can
+    // reach. `--out` is the operator's own argument and is used verbatim.
+    let target = match out {
         Some(t) => t.to_path_buf(),
-        None => {
-            return Err(stage(
-                "no output target — pass --out or set <render target>".to_string(),
-                bundles,
-            ));
-        }
+        None => match resolved_tracks_target(&scene) {
+            Some(t) => match confine_target(&project_root, t) {
+                Ok(t) => t,
+                Err(e) => return Err(stage(e, bundles)),
+            },
+            None => {
+                return Err(stage(
+                    "no output target — pass --out or set <render target>".to_string(),
+                    bundles,
+                ));
+            }
+        },
     };
     if let Some(parent) = target.parent()
         && let Err(e) = fs::create_dir_all(parent)
@@ -427,8 +451,6 @@ pub fn render_inner(
             bundles,
         ));
     }
-
-    let project_root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     // Program audio: collect music/sound → 48kHz mix → muxed into the
     // same ffmpeg process as the video pipe. No audio elements = silent.
@@ -565,8 +587,8 @@ fn parse_frame_range(spec: &str) -> Option<std::ops::Range<u32>> {
         let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
         (end > start).then_some(start..end)
     } else {
-        let n = spec.trim().parse().ok()?;
-        Some(n..n + 1)
+        let n: u32 = spec.trim().parse().ok()?;
+        n.checked_add(1).map(|end| n..end)
     }
 }
 
@@ -589,12 +611,29 @@ fn renderer_factory<'a>(
         images: Box::new(
             StillFrameSource::new(project_root.clone()).with_warnings(warnings.clone()),
         ),
-        programs: Box::new(SandboxPrograms::new(project_root.clone())),
+        programs: Box::new(
+            SandboxPrograms::new(project_root.clone()).with_warnings(warnings.clone()),
+        ),
     }
 }
 
 fn resolved_tracks_target(scene: &scene_ir::Scene) -> Option<&Path> {
     scene.render.as_ref().map(|r| Path::new(r.target.as_str()))
+}
+
+/// Resolve an authored `<render target>` against the project root and
+/// refuse escapes — absolute targets, `..` components, and symlinks
+/// inside the root pointing out are all markup trying to write files
+/// ffmpeg shouldn't touch. Shared with `src` confinement in
+/// `scene_media::confine_under_root`.
+fn confine_target(root: &Path, target: &Path) -> Result<PathBuf, String> {
+    scene_media::confine_under_root(root, target).map_err(|e| {
+        format!(
+            "render target `{}` escapes the project root (must land under {})",
+            e.rel.display(),
+            e.root.display()
+        )
+    })
 }
 
 /// List the capabilities a scene.toml registers.
@@ -686,7 +725,13 @@ pub fn doctor() -> i32 {
     ];
     let mut missing = 0;
     for (tool, role) in tools {
-        match Command::new(tool).arg("-version").output() {
+        // `-version` exits instantly on a healthy binary; ten seconds
+        // catches a wedged shim/wrapper instead of hanging doctor.
+        match scene_media::output_timeout(
+            Command::new(tool).arg("-version"),
+            tool,
+            std::time::Duration::from_secs(10),
+        ) {
             Ok(out) => {
                 let first = String::from_utf8_lossy(&out.stdout)
                     .lines()
@@ -833,6 +878,43 @@ mod tests {
         assert_eq!(parse_frame_range("9:5"), None);
         assert_eq!(parse_frame_range("x"), None);
         assert_eq!(parse_frame_range("1:x"), None);
+        // u32::MAX must not wrap the implicit `n..n+1`.
+        assert_eq!(parse_frame_range("4294967295"), None);
+    }
+
+    #[test]
+    fn confine_target_keeps_writes_inside_the_project() {
+        let root = Path::new(".");
+        // confine_target returns canonical paths — compare against the
+        // canonical cwd so a symlinked cwd can't break the assert.
+        let cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        // Relative target resolves under the project root.
+        assert_eq!(
+            confine_target(root, Path::new("out/final.mp4")).unwrap(),
+            cwd.join("out/final.mp4")
+        );
+        // `..` and absolute-outside targets are refused, not clamped.
+        assert!(confine_target(root, Path::new("../escape.mp4")).is_err());
+        assert!(confine_target(root, Path::new("/tmp/escape.mp4")).is_err());
+        assert!(confine_target(root, Path::new("out/../../escape.mp4")).is_err());
+        // An absolute path *inside* the root is still allowed.
+        let inside = cwd.join("sub").join("x.mp4");
+        assert_eq!(confine_target(root, &inside).unwrap(), inside);
+        // A symlink inside the root pointing out is refused too.
+        #[cfg(unix)]
+        {
+            let tmp = std::env::temp_dir().join(format!("confine-sym-{}", std::process::id()));
+            fs::create_dir_all(&tmp).unwrap();
+            let link = cwd.join(format!("confine-link-{}", std::process::id()));
+            std::os::unix::fs::symlink(&tmp, &link).unwrap();
+            let t = format!("confine-link-{}/x.mp4", std::process::id());
+            // Clean up before asserting so a failure leaves no stray
+            // symlink inside the project root.
+            let result = confine_target(root, Path::new(&t));
+            let _ = fs::remove_file(&link);
+            let _ = fs::remove_dir_all(&tmp);
+            assert!(result.is_err());
+        }
     }
 
     #[test]

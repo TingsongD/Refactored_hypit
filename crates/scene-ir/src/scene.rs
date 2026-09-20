@@ -387,10 +387,16 @@ pub struct RenderTarget {
 /// `gain="-14dB"` or `gain="-14"`.
 pub fn parse_gain_db(s: &str) -> Result<f64, String> {
     let digits = s.strip_suffix("dB").unwrap_or(s);
-    digits
+    let v: f64 = digits
         .trim()
         .parse()
-        .map_err(|_| format!("invalid gain `{s}` (try `-14dB`)"))
+        .map_err(|_| format!("invalid gain `{s}` (try `-14dB`)"))?;
+    // `f64::parse` accepts `nan`/`inf`/`1e999` — they must not reach the
+    // filtergraph as `volume=nan`.
+    if !v.is_finite() {
+        return Err(format!("invalid gain `{s}` (must be a finite number)"));
+    }
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -468,5 +474,9 @@ mod tests {
         assert_eq!(parse_gain_db("-14dB").unwrap(), -14.0);
         assert_eq!(parse_gain_db("0").unwrap(), 0.0);
         assert!(parse_gain_db("loud").is_err());
+        // f64::parse accepts these — they must never reach a filtergraph.
+        assert!(parse_gain_db("nan").is_err());
+        assert!(parse_gain_db("inf").is_err());
+        assert!(parse_gain_db("1e999").is_err());
     }
 }

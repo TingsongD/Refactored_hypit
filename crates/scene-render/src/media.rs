@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use scene_media::{Frame, FrameStream, MediaError, probe};
+use scene_media::{Frame, FrameStream, MediaError, confine_under_root, probe};
 
 /// Shared per-render failure log. Worker-local sources record
 /// `src → reason` here; the caller drains it into diagnostics after
@@ -22,6 +22,23 @@ fn warn(sink: &Option<WarnSink>, msg: String) {
         && let Ok(mut w) = s.lock()
     {
         w.insert(msg);
+    }
+}
+
+/// `root.join(src)` under project-root confinement — an authored `src`
+/// may not reach outside the scene file's directory (same contract as
+/// `program` sources and `<render target>`). An escape warns once and
+/// reads as a permanently failed source, like a missing file.
+fn confined(root: &Path, src: &str, kind: &str, warnings: &Option<WarnSink>) -> Option<PathBuf> {
+    match confine_under_root(root, Path::new(src)) {
+        Ok(path) => Some(path),
+        Err(_) => {
+            warn(
+                warnings,
+                format!("{kind} `{src}` escapes the project root — refused"),
+            );
+            None
+        }
     }
 }
 
@@ -44,7 +61,8 @@ pub struct SeqFrameSource {
 }
 
 struct SeqStream {
-    stream: FrameStream,
+    /// Boxed so tests can drive the advance loop with a fake stream.
+    stream: Box<dyn Iterator<Item = Result<Frame, MediaError>>>,
     /// Rate ratio: source frames per program frame.
     ratio: f64,
     /// Source-frame index the decode started at — nonzero after a `-ss`
@@ -52,6 +70,9 @@ struct SeqStream {
     base: u64,
     /// The latest decoded frame and its source index.
     current: Option<Frame>,
+    /// True once the stream hit EOF or failed — a dead stream is never
+    /// polled again (a failed child's `wait` would error every call).
+    dead: bool,
 }
 
 /// Prefix length past which an initial `-ss` seek beats decoding and
@@ -102,10 +123,11 @@ impl SeqFrameSource {
         };
         stream
             .map(|stream| SeqStream {
-                stream,
+                stream: Box::new(stream),
                 ratio: source_fps,
                 base,
                 current: None,
+                dead: false,
             })
             .map_err(|e| format!("{}: {e}", path.display()))
     }
@@ -121,9 +143,15 @@ impl SeqFrameSource {
         warnings: &Option<WarnSink>,
     ) -> Option<&'a mut SeqStream> {
         if !streams.contains_key(src) {
-            match Self::spawn(&root.join(src), frame, program_fps) {
-                Ok(s) => {
+            match confined(root, src, "clip", warnings)
+                .map(|p| Self::spawn(&p, frame, program_fps))
+                .transpose()
+            {
+                Ok(Some(s)) => {
                     streams.insert(src.to_string(), Some(s));
+                }
+                Ok(None) => {
+                    streams.insert(src.to_string(), None);
                 }
                 Err(e) => {
                     warn(warnings, format!("clip `{src}` unreadable: {e}"));
@@ -150,8 +178,12 @@ impl FrameSource for SeqFrameSource {
         // the pipe can't rewind, so serving `current` would freeze the
         // clip on the previous element's last frame. Reopen instead.
         if seq.current.as_ref().is_some_and(|f| f.index > target) {
-            match Self::spawn(&self.root.join(src), frame, fps) {
-                Ok(s) => *seq = s,
+            match confined(&self.root, src, "clip", &self.warnings)
+                .map(|p| Self::spawn(&p, frame, fps))
+                .transpose()
+            {
+                Ok(Some(s)) => *seq = s,
+                Ok(None) => return None,
                 Err(e) => {
                     warn(&self.warnings, format!("clip `{src}` unreadable: {e}"));
                     return None;
@@ -159,15 +191,26 @@ impl FrameSource for SeqFrameSource {
             }
         }
         // Advance the decode until the current frame covers `target`.
+        // `Some(Err)` is not EOF: a mid-file failure must reach the
+        // warning sink instead of silently freezing on the last frame.
         loop {
             match &seq.current {
                 Some(f) if f.index >= target => return Some(f.clone()),
+                _ if seq.dead => return seq.current.clone(),
                 _ => match seq.stream.next() {
                     Some(Ok(mut f)) => {
                         f.index += seq.base;
                         seq.current = Some(f);
                     }
-                    _ => return seq.current.clone(),
+                    Some(Err(e)) => {
+                        warn(&self.warnings, format!("clip `{src}` decode failed: {e}"));
+                        seq.dead = true;
+                        return seq.current.clone();
+                    }
+                    None => {
+                        seq.dead = true;
+                        return seq.current.clone();
+                    }
                 },
             }
         }
@@ -230,9 +273,15 @@ impl StillFrameSource {
 impl FrameSource for StillFrameSource {
     fn sample(&mut self, src: &str, _frame: u64, _fps: f64) -> Option<Frame> {
         if !self.cache.contains_key(src) {
-            match decode_still(&self.root.join(src)) {
-                Ok(f) => {
+            match confined(&self.root, src, "image", &self.warnings)
+                .map(|p| decode_still(&p))
+                .transpose()
+            {
+                Ok(Some(f)) => {
                     self.cache.insert(src.to_string(), Some(f));
+                }
+                Ok(None) => {
+                    self.cache.insert(src.to_string(), None);
                 }
                 Err(e) => {
                     warn(&self.warnings, format!("image `{src}` unreadable: {e}"));
@@ -262,6 +311,30 @@ mod tests {
     }
 
     #[test]
+    fn escaping_src_is_refused_and_warned() {
+        let sink = WarnSink::default();
+        let mut still = StillFrameSource::new(PathBuf::from(".")).with_warnings(sink.clone());
+        // `..` and absolute escapes refuse before the decoder runs.
+        assert!(still.sample("../outside.png", 0, 0.0).is_none());
+        assert!(still.sample("/etc/passwd", 0, 0.0).is_none());
+        // Cached failure — no second warning per src.
+        assert!(still.sample("../outside.png", 1, 0.0).is_none());
+        let w = sink.lock().unwrap();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w.iter().all(|m| m.contains("escapes the project root")),
+            "{w:?}"
+        );
+        drop(w);
+
+        let mut seq = SeqFrameSource::new(PathBuf::from(".")).with_warnings(sink.clone());
+        assert!(seq.sample("../clip.mp4", 0, 30.0).is_none());
+        assert!(seq.sample("/abs/clip.mp4", 0, 30.0).is_none());
+        let w = sink.lock().unwrap();
+        assert_eq!(w.len(), 4, "{w:?}");
+    }
+
+    #[test]
     fn missing_clip_reports_into_the_sink() {
         let sink = WarnSink::default();
         let mut source =
@@ -274,5 +347,61 @@ mod tests {
     fn no_sink_is_silent_but_still_none() {
         let mut source = StillFrameSource::new(PathBuf::from("/nonexistent-dir"));
         assert!(source.sample("missing.png", 0, 0.0).is_none());
+    }
+
+    /// Yields two frames, one error, then panics if polled again — the
+    /// dead flag must stop the source from re-polling a failed stream.
+    struct FailThenPanic {
+        items: std::vec::IntoIter<Result<Frame, MediaError>>,
+        err_once: bool,
+    }
+    impl Iterator for FailThenPanic {
+        type Item = Result<Frame, MediaError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            if let Some(item) = self.items.next() {
+                return Some(item);
+            }
+            if self.err_once {
+                self.err_once = false;
+                return Some(Err(MediaError::Io(std::io::Error::other(
+                    "decoder blew up",
+                ))));
+            }
+            panic!("polled a dead stream");
+        }
+    }
+
+    #[test]
+    fn mid_stream_decode_error_warns_and_holds_the_last_frame() {
+        let sink = WarnSink::default();
+        let mut source = SeqFrameSource::new(PathBuf::from("/unused")).with_warnings(sink.clone());
+        let frame = |index: u64| Frame {
+            index,
+            width: 1,
+            height: 1,
+            pixels: vec![index as u8; 4],
+        };
+        source.streams.insert(
+            "c.mp4".to_string(),
+            Some(SeqStream {
+                stream: Box::new(FailThenPanic {
+                    items: vec![Ok(frame(0)), Ok(frame(1))].into_iter(),
+                    err_once: true,
+                }),
+                ratio: 30.0,
+                base: 0,
+                current: None,
+                dead: false,
+            }),
+        );
+        assert_eq!(source.sample("c.mp4", 0, 30.0).unwrap().index, 0);
+        // Frame 2 targets past the failure — the error surfaces and the
+        // last decoded frame holds.
+        assert_eq!(source.sample("c.mp4", 2, 30.0).unwrap().index, 1);
+        // Polling again must not touch the stream (would panic).
+        assert_eq!(source.sample("c.mp4", 3, 30.0).unwrap().index, 1);
+        let w = sink.lock().unwrap();
+        assert_eq!(w.len(), 1);
+        assert!(w.iter().next().unwrap().contains("decode failed"), "{w:?}");
     }
 }

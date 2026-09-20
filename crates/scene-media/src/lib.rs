@@ -5,13 +5,19 @@
 //! - [`FrameStream`] — sequential `ffmpeg` rawvideo decode → RGBA frames
 //! - [`Encoder`] — NV12 program stream → H.264/mp4
 
+mod confine;
 mod decode;
 mod encode;
 mod error;
 mod probe;
+mod proc;
 mod stderr;
+mod watchdog;
 
+pub use confine::{Escapes, confine_under_root};
 pub use decode::{Frame, FrameStream};
 pub use encode::Encoder;
 pub use error::{MediaError, Tool};
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, parse_probe_json, probe};
+pub use proc::{ProcOutput, output_timeout, wait_timeout};
+pub use watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};

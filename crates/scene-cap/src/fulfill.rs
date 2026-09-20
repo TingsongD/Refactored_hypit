@@ -98,10 +98,14 @@ pub fn fulfill(reg: &Registry, req: &CapRequest) -> Result<PathBuf, CapError> {
 /// Response body goes straight to `out`; `-f` turns non-2xx into a
 /// failure we can read from stderr. `config` is the `-K` file carrying
 /// the auth header — its *path* is safe for argv; its contents are not.
+/// `--max-time` makes curl itself abort a stalled transfer rather than
+/// relying solely on our process-level timeout to notice.
 pub fn http_args(endpoint: &str, config: Option<&Path>, out: &Path) -> Vec<String> {
     let mut args = vec![
         "curl".to_string(),
         "-sfS".into(),
+        "--max-time".into(),
+        "300".into(),
         "-X".into(),
         "POST".into(),
         "-H".into(),
@@ -152,6 +156,11 @@ impl Drop for CurlRc {
     }
 }
 
+/// A connector is a network call — a wedged subprocess or stalled curl
+/// must not hang the engine forever. Ten minutes is a hang, not a slow
+/// render step (curl self-aborts at five via `--max-time`).
+const CONNECTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 fn run_process(
     cap: &Capability,
     argv: &[String],
@@ -196,11 +205,21 @@ fn run_process(
     let writer = std::thread::spawn(move || {
         std::io::Write::write_all(&mut stdin, doc.as_bytes()).map_err(|e| e.to_string())
     });
-    let status = child.wait()?;
+    // Deadlined wait: on timeout the child is killed and reaped — the
+    // writer sees EPIPE and the drain hits EOF, so both threads end.
+    let status = scene_media::wait_timeout(&mut child, "connector", CONNECTOR_TIMEOUT);
     // A failed write means the connector closed stdin early — its exit
     // status and stderr carry the real story; don't mask it.
     let _ = writer.join();
     let stderr_bytes = drain.join().unwrap_or_default();
+    let status = status.map_err(|e| match e {
+        scene_media::MediaError::Io(io) => CapError::Io(io),
+        other => CapError::Failed {
+            cap: cap.name.clone(),
+            status: "timeout".to_string(),
+            detail: format!("{other}: {}", String::from_utf8_lossy(&stderr_bytes).trim()),
+        },
+    })?;
     if !status.success() {
         return Err(CapError::Failed {
             cap: cap.name.clone(),

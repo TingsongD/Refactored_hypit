@@ -171,7 +171,7 @@ and no longer claims single-shot footage emits zero boards; `DESIGN.md`
 lists `program` as shipped and names `engine ui`; the Module A entry
 above now honestly describes buffered ranges.
 
-## 2026-02-11 — Module G: streaming render pool
+## 2026-09-19 — Module G: streaming render pool
 
 `render_frames` used to materialize every frame before encoding — at
 1080×1920 RGBA a 60 s/30 fps render held ~15 GB in RAM. Now
@@ -209,3 +209,76 @@ stays ≪1 GB well past `q=16`.
 `open_scaled` can't take a seek window; `read_request` doesn't parse
 chunked request bodies; `emit_scene` reuses the source video as the
 draft's `<music src>` (intentional placeholder); no LICENSE file yet.
+
+## 2026-09-20 — Review round 3: input-craft and hang hardening
+
+A full-codebase review after Module G surfaced six more fixes:
+
+- **Parser depth cap.** `parse_node` recursed per nesting level with no
+  bound — a ~10k-deep document segfaulted the process (uncatchable, and
+  it takes the UI server down too). Cap at 128; the over-deep doc is a
+  diagnostic. Since every downstream pass (lower/resolve/layout) walks
+  the same tree, one bound at the parser bounds them all.
+- **Mid-stream decode errors reach the sink.** `SeqFrameSource` folded
+  `Some(Err)` into the EOF arm — a corrupt-in-the-middle clip silently
+  froze on its last good frame. Now the error warns once per source and
+  the stream is marked dead so a failed child is never re-polled.
+- **`<render target>` is confined.** It used to resolve verbatim —
+  `../` or absolute targets let markup create dirs and `-y`-truncate
+  files anywhere ffmpeg could reach. `confine_target` normalizes
+  lexically, then canonicalizes the root and the target's deepest
+  existing ancestor so a symlink inside the project pointing out is
+  refused too. `--out` stays the operator's own argument, verbatim.
+  `lower` flags `..`/absolute targets at check time.
+- **Program warnings route through `WarnSink`.** `SandboxPrograms`
+  `eprintln!`ed refused/missing/failed scripts — the UI never saw them.
+  `with_warnings` feeds the shared sink, same contract as the media
+  sources; dedup falls out of the `BTreeSet`.
+- **Input validation.** `parse_gain_db` rejects `nan`/`inf`/`1e999`
+  (they used to reach the filtergraph as `volume=nan`). New
+  `TimingSource::validate` reports words with non-finite/negative or
+  reversed times — whisperx and `--timings` files both checked.
+  `parse_frame_range` uses `checked_add` so `--frames 4294967295`
+  returns `None` instead of wrapping.
+- **Every subprocess has a deadline.** New `proc::wait_timeout` /
+  `output_timeout` (kill+reap, drained pipes) cover `ffprobe`, the mix
+  render, `yt-dlp`, keychain reads, connectors, `curl` (plus its own
+  `--max-time 300`), and `doctor`. Streaming decode/encode can't use a
+  wait deadline alone — a blocked pipe `read`/`write` can't rescue
+  itself — so they carry a `watchdog::StallWatchdog`: an atomic
+  heartbeat per successful I/O, SIGKILL by pid on unix when it goes
+  stale (5 min decode / 2 min encode), plus fixed deadlines on EOF reap
+  and muxer teardown. On non-unix the watchdog compiles to a no-op;
+  `wait_timeout` still applies everywhere.
+
+Gate: fmt, clippy `-D warnings`, workspace tests, `SCENE_MEDIA_TESTS=1`
+— all green.
+
+## 2026-09-20 — Review round 4: uniform src confinement
+
+The last review caught that confinement was uniform everywhere *except*
+the most common path: media `src`.
+
+- **Media `src` is now confined like everything else.** `clip`, `image`,
+  `music`, and `sound` used bare `root.join(src)` — an absolute path or
+  `..` sailed through to ffmpeg/the image decoder while `program` src
+  and `<render target>` were already refused. New shared helper
+  `scene_media::confine_under_root` (lexical `..` normalize +
+  canonicalize deepest existing ancestor → symlink-out fails too) is
+  used by `SeqFrameSource`, `StillFrameSource`, `AudioGraph::collect`,
+  and `confine_target` — one implementation, four call sites. Escapes
+  warn once (`WarnSink` / diagnostics) and degrade like a missing file
+  instead of killing the render. `src_attr` in lowering now flags
+  absolute paths at `check` time, not just `..`.
+- **Disarm-before-reap in decode EOF.** `FrameStream`'s EOF arm reaped
+  with `wait_timeout` *then* disarmed the stall watchdog — backwards:
+  a reaped pid is recyclable while the watchdog was still armed. Now
+  disarm runs first (matching `Encoder::finish`); the reap deadline is
+  `wait_timeout`'s own kill path.
+- **Doc corrections.** `adapt-clip.md` suggested `gain="-inf"`, which
+  the new finite check rejects (`-60dB` is the mute). `duck` is now
+  documented as `<music>`-only — on `<sound>` it's dropped with a
+  warning. DEV_LOG date ordering fixed (Module G / round 3 were
+  mislabeled 2026-02-xx).
+
+Gate: fmt, clippy `-D warnings`, workspace tests — all green.

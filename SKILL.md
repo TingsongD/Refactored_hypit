@@ -72,11 +72,17 @@ board's span.
 - `text` — literal body text or `bind="line.field"` into the script
 - `board` — styled group; children stack vertically inside it
 - `captions anchor="track.words"` — word-highlighted subtitles
-- `music` / `sound` — 48 kHz audio; `gain="-6dB"`, `duck="voice"`
+- `music` / `sound` — 48 kHz audio; `gain="-6dB"` (finite), `duck="voice"`
+  — `duck` works on `music` only; on `sound` it's ignored with a warning
 - `program src with` — sandboxed JS draw program (below)
 
 Common attributes: `during`, `at` (`center|top|bottom|left|right` or
-`x,y`), `anim` (`rise`, `pop`, `fade`, `slide-left`, …), `id`.
+`x,y`), `anim` (`rise`, `pop`, `fade`), `id`.
+
+All `src` attributes and `<render target>` resolve against the project
+root and must stay inside it — `..` and absolute paths are refused
+(`check` warns, `render` errors). `--out` is the only way to write
+outside the project dir.
 
 ## Programs (sandboxed draw scripts)
 
@@ -126,5 +132,7 @@ See `connectors/` for reference scripts.
 `check` reports like rustc — every error carries a byte span rendered
 against the source. Unknown elements/attributes, unresolved cues,
 missing `src`, bad JSON in `with`, missing asset files all surface
-before render. Treat warnings (missing assets, ignored text) as
-real feedback — they usually mean the scene won't look like you expect.
+before render. Render-time problems (missing/corrupt media, refused or
+broken programs, stale timing fingerprints, invalid word times) collect
+into a warnings bundle — treat warnings as real feedback; they usually
+mean the scene won't look like you expect.

@@ -71,14 +71,19 @@ impl Lower {
     /// flagging even though authored scenes are trusted. URLs pass.
     fn src_attr<'a>(&mut self, node: &'a RawNode) -> Option<&'a RawAttr> {
         let attr = self.req_attr(node, "src")?;
+        // Runtime sources refuse escapes outright (project-root
+        // confinement) — flag the same shapes at check time.
+        let path = std::path::Path::new(&attr.value);
         if !attr.value.contains("://")
-            && std::path::Path::new(&attr.value)
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
+            && (path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)))
         {
             self.warning(
                 attr.value_span,
-                "src path contains `..` — it may escape the project root".to_string(),
+                "src path is absolute or contains `..` — it must land inside the project root"
+                    .to_string(),
             );
         }
         Some(attr)
@@ -447,8 +452,22 @@ impl Lower {
         for child in node.element_children() {
             self.error(child.name_span, "<render> takes no elements");
         }
-        self.req_attr(node, "target").map(|a| RenderTarget {
-            target: a.value.clone(),
+        let attr = self.req_attr(node, "target")?;
+        // The output side gets the same advisory `src` does — render
+        // refuses an escaping target outright, so flag it at check time.
+        let path = std::path::Path::new(&attr.value);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            self.warning(
+                attr.value_span,
+                "render target is absolute or contains `..` — it must land inside the project root",
+            );
+        }
+        Some(RenderTarget {
+            target: attr.value.clone(),
             span: node.span,
         })
     }
@@ -604,6 +623,42 @@ mod tests {
         let errs = errors(&diags);
         assert!(errs.iter().any(|m| m.contains("`canvas`")), "{errs:?}");
         assert!(errs.iter().any(|m| m.contains("`fps`")), "{errs:?}");
+    }
+
+    #[test]
+    fn escaping_src_warns() {
+        // Runtime sources refuse outright; `check` flags it here first.
+        for src in ["../escape.mp4", "/abs/bg.mp4"] {
+            let markup = SCENE.replace("a.mp4", src);
+            let (_, diags) = lower_str(&markup);
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| !d.is_error() && d.message.contains("project root")),
+                "no warning for src `{src}`"
+            );
+        }
+        // A normal relative src stays quiet.
+        let (_, diags) = lower_str(SCENE);
+        assert!(!diags.iter().any(|d| d.message.contains("project root")));
+    }
+
+    #[test]
+    fn escaping_render_target_warns() {
+        // The render path refuses outright; `check` flags it here first.
+        for target in ["../escape.mp4", "/abs/out.mp4", "out/../../x.mp4"] {
+            let src = SCENE.replace("out/final.mp4", target);
+            let (_, diags) = lower_str(&src);
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| !d.is_error() && d.message.contains("project root")),
+                "no warning for `{target}`"
+            );
+        }
+        // A normal relative target stays quiet.
+        let (_, diags) = lower_str(SCENE);
+        assert!(!diags.iter().any(|d| d.message.contains("project root")));
     }
 
     #[test]

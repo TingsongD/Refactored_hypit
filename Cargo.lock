@@ -860,6 +860,7 @@ dependencies = [
 name = "scene-cap"
 version = "0.0.0"
 dependencies = [
+ "scene-media",
  "serde",
  "serde_json",
  "thiserror",
@@ -893,6 +894,7 @@ dependencies = [
 name = "scene-media"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "scene-ir",
  "serde",
  "serde_json",

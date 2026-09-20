@@ -70,6 +70,10 @@ pub fn keychain_args(service: &str, account: &str) -> (&'static str, Vec<String>
     }
 }
 
+/// Keychain reads are local IPC — a wedged `security`/`secret-tool`
+/// shouldn't hang a render. Fifteen seconds is already absurd.
+const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn keychain_lookup(service: &str, account: &str) -> Result<String, AuthError> {
     let (tool, args) = keychain_args(service, account);
     let err = |detail: String| AuthError::Keychain {
@@ -77,10 +81,9 @@ fn keychain_lookup(service: &str, account: &str) -> Result<String, AuthError> {
         account: account.into(),
         detail,
     };
-    let output = Command::new(tool)
-        .args(&args)
-        .output()
-        .map_err(|e| err(e.to_string()))?;
+    let output =
+        scene_media::output_timeout(Command::new(tool).args(&args), tool, KEYCHAIN_TIMEOUT)
+            .map_err(|e| err(e.to_string()))?;
     if !output.status.success() {
         return Err(err(String::from_utf8_lossy(&output.stderr)
             .trim()
