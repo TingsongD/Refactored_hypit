@@ -5,12 +5,12 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use crate::error::{MediaError, Tool};
 use crate::probe::MediaInfo;
-use crate::proc::{spawn_grouped, wait_timeout};
+use crate::proc::{StreamingChild, wait_stream};
 use crate::stderr::StderrDrain;
 use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat, watch_io};
 
@@ -31,7 +31,7 @@ pub struct PcmChunk {
 /// Streams decoded PCM from an ffmpeg subprocess. Dropping kills the
 /// child (closing stdout makes ffmpeg exit on its own; we reap anyway).
 pub struct PcmStream {
-    child: Child,
+    child: StreamingChild,
     stdout: ChildStdout,
     /// stderr drains on a thread so a chatty decoder can't fill the
     /// pipe and deadlock against our stdout reads.
@@ -74,14 +74,14 @@ impl PcmStream {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = spawn_grouped(&mut cmd).map_err(|e| MediaError::Spawn {
+        let mut child = StreamingChild::spawn(&mut cmd).map_err(|e| MediaError::Spawn {
             tool: "ffmpeg",
             source: e,
         })?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
         let heartbeat = heartbeat();
-        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), STALL_LIMIT);
+        let watchdog = child.watchdog(heartbeat.clone(), STALL_LIMIT);
         Ok(Some(PcmStream {
             child,
             stdout,
@@ -149,7 +149,7 @@ impl Iterator for PcmStream {
                 // child is reaped its pid can be recycled, and a still-
                 // armed watchdog ticking could kill a stranger.
                 self.watchdog.disarm();
-                let status = wait_timeout(&mut self.child, "ffmpeg", REAP_TIMEOUT);
+                let status = wait_stream(&mut self.child, &mut self.stderr, "ffmpeg", REAP_TIMEOUT);
                 match status {
                     Ok(status) if status.success() => None,
                     Ok(status) => Some(Err(MediaError::Failed {
@@ -190,9 +190,7 @@ impl Drop for PcmStream {
         self.watchdog.disarm();
         // Closing stdout already signals EOF; kill only if still alive,
         // then reap so no zombie remains.
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -202,7 +200,7 @@ mod deadline_tests {
     use super::*;
     #[test]
     fn pcm_blocked_read_is_guarded_but_idle_stream_is_not() {
-        let mut child = spawn_grouped(
+        let mut child = StreamingChild::spawn(
             Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -218,7 +216,7 @@ mod deadline_tests {
         let stdout = child.stdout.take().unwrap();
         let stderr = StderrDrain::start(child.stderr.take().unwrap());
         let heartbeat = heartbeat();
-        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), Duration::from_millis(80));
+        let watchdog = child.watchdog(heartbeat.clone(), Duration::from_millis(80));
         let mut stream = PcmStream {
             child,
             stdout,

@@ -84,6 +84,11 @@ pub fn package_doc(brief: &Brief, keeps: &[&Candidate], analysis: &GeminiAnalysi
 pub fn parse_package(text: &str) -> Result<PackageOutcome, MemeError> {
     let out: PackageOutcome = serde_json::from_str(text)
         .map_err(|e| MemeError::Stage(format!("jev package response is not valid JSON: {e}")))?;
+    if out.postable > 5 || !(0.0..=1.0).contains(&out.confidence) {
+        return Err(MemeError::Stage(
+            "jev package values are outside their ranges".into(),
+        ));
+    }
     if let Package::RerunWindow { keep_id } = &out.package
         && keep_id.is_empty()
     {

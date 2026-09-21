@@ -4,12 +4,12 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use crate::error::{MediaError, Tool};
 use crate::probe::{MediaInfo, probe};
-use crate::proc::{spawn_grouped, wait_timeout};
+use crate::proc::{StreamingChild, wait_stream};
 use crate::stderr::StderrDrain;
 use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat, watch_io};
 
@@ -48,7 +48,7 @@ pub struct DecodeWindow {
 /// Streams decoded frames from an ffmpeg subprocess. Dropping kills the
 /// child (closing stdout makes ffmpeg exit on its own; we reap it anyway).
 pub struct FrameStream {
-    child: Child,
+    child: StreamingChild,
     stdout: ChildStdout,
     /// stderr drains on a thread so a chatty decoder can't fill the pipe
     /// and deadlock against our stdout reads.
@@ -109,6 +109,7 @@ impl FrameStream {
         if let Some(window) = window {
             if !window.start_s.is_finite()
                 || !window.end_s.is_finite()
+                || !(window.end_s * fps).is_finite()
                 || window.start_s < 0.0
                 || window.end_s <= window.start_s
             {
@@ -118,14 +119,16 @@ impl FrameStream {
             }
             args = vec![
                 "-copyts".to_string(),
+                "-start_at_zero".to_string(),
                 "-ss".to_string(),
                 (window.start_s.floor() - 1.0).max(0.0).to_string(),
                 "-to".to_string(),
-                window.end_s.to_string(),
+                (window.end_s + 1.0 / fps).to_string(),
             ];
             filter.push_str(&format!(
-                ",trim=start={}:end={},setpts=PTS-STARTPTS",
-                window.start_s, window.end_s
+                ",trim=start_pts={}:end_pts={},setpts=PTS-STARTPTS",
+                (window.start_s * fps - 1e-9).ceil().max(0.0),
+                (window.end_s * fps - 1e-9).ceil()
             ));
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -159,6 +162,15 @@ impl FrameStream {
         vf: Option<String>,
         (width, height): (u32, u32),
     ) -> Result<Self, MediaError> {
+        let bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if width == 0 || height == 0 || bytes.is_none_or(|n| n > 1024 * 1024 * 1024) {
+            return Err(MediaError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "decoded dimensions must fit within a 1 GiB frame",
+            )));
+        }
         if info.video.is_none() {
             return Err(MediaError::NoVideoStream);
         }
@@ -175,14 +187,14 @@ impl FrameStream {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = spawn_grouped(&mut cmd).map_err(|e| MediaError::Spawn {
+        let mut child = StreamingChild::spawn(&mut cmd).map_err(|e| MediaError::Spawn {
             tool: "ffmpeg",
             source: e,
         })?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
         let heartbeat = heartbeat();
-        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), STALL_LIMIT);
+        let watchdog = child.watchdog(heartbeat.clone(), STALL_LIMIT);
         Ok(FrameStream {
             child,
             stdout,
@@ -254,7 +266,7 @@ impl Iterator for FrameStream {
                 // armed watchdog ticking could kill a stranger. The reap
                 // deadline is wait_timeout's own kill path.
                 self.watchdog.disarm();
-                let status = wait_timeout(&mut self.child, "ffmpeg", REAP_TIMEOUT);
+                let status = wait_stream(&mut self.child, &mut self.stderr, "ffmpeg", REAP_TIMEOUT);
                 match status {
                     Ok(status) if status.success() => None,
                     Ok(status) => Some(Err(MediaError::Failed {
@@ -281,9 +293,7 @@ impl Drop for FrameStream {
         self.watchdog.disarm();
         // Closing stdout already signals EOF; kill only if still alive,
         // then reap so no zombie remains.
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }

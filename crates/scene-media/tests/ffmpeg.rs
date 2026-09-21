@@ -291,7 +291,9 @@ fn scaled_windows_match_sequential_cfr() {
                 "-i",
                 "testsrc=size=160x90:rate=10:duration=3",
                 "-pix_fmt",
-                "yuv420p"
+                "yuv420p",
+                "-output_ts_offset",
+                "5"
             ])
             .arg(&path)
             .status()
@@ -303,24 +305,28 @@ fn scaled_windows_match_sequential_cfr() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    let selected: Vec<_> = FrameStream::open_scaled_window(
-        &path,
-        &info,
-        80,
-        46,
-        10.0,
-        Some(scene_media::DecodeWindow {
-            start_s: 2.3,
-            end_s: 2.7,
-        }),
-    )
-    .unwrap()
-    .collect::<Result<_, _>>()
-    .unwrap();
-    assert_eq!(selected.len(), 4);
-    for (i, frame) in selected.iter().enumerate() {
-        assert_eq!(frame.index, i as u64);
-        assert_eq!(frame.pixels, all[i + 23].pixels);
+    for (start_s, end_s, range) in [
+        (2.3, 2.7, 23..27),
+        (2.3, 2.71, 23..28),
+        (2.31, 2.69, 24..27),
+        (0.0, 0.01, 0..1),
+    ] {
+        let selected: Vec<_> = FrameStream::open_scaled_window(
+            &path,
+            &info,
+            80,
+            46,
+            10.0,
+            Some(scene_media::DecodeWindow { start_s, end_s }),
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+        assert_eq!(selected.len(), range.len(), "window {start_s}..{end_s}");
+        for (i, source) in range.enumerate() {
+            assert_eq!(selected[i].index, i as u64);
+            assert_eq!(selected[i].pixels, all[source].pixels);
+        }
     }
     for (start_s, end_s) in [(1.0, 0.0), (0.0, f64::INFINITY), (-1.0, 1.0)] {
         assert!(

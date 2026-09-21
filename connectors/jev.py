@@ -35,6 +35,8 @@ def normalize(task, response):
     elif task == "jev_package":
         if response["package"] not in ("export", "need_more_peaks", "rerun_window"):
             raise ValueError("invalid package decision")
+        if not 0 <= response.get("confidence", 1) <= 1 or not 0 <= response.get("postable", 0) <= 5:
+            raise ValueError("invalid package scores")
         if response["package"] == "rerun_window" and not response.get("keep_id"):
             raise ValueError("rerun requires keep_id")
     else:

@@ -150,7 +150,12 @@ pub fn pick_peaks(
         if flux_max <= 0.0 {
             0.0
         } else {
-            (p.audio[i].onset / flux_max).clamp(0.0, 1.0)
+            let normalized = (p.audio[i].onset / flux_max).clamp(0.0, 1.0);
+            if normalized >= brief.onset_keep {
+                normalized
+            } else {
+                0.0
+            }
         }
     };
     let base_imp = |i: usize| -> f64 {

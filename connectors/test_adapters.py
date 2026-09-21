@@ -59,6 +59,22 @@ class Adapters(unittest.TestCase):
             with self.assertRaises((ValueError, KeyError)):
                 jev.normalize(task, result)
 
+    def test_jev_mock_transport(self):
+        for task, state, result in [("jev_route", {"candidates": []}, {"answers": {}}),
+                                    ("jev_package", {"keeps": []}, {"package": "export"})]:
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "result.json"
+                req = {"out": str(output), "params": {"task": task, "state": state,
+                       "brief": {}, "questions": {"choice": []}}}
+                transport = Mock(return_value=io.BytesIO(json.dumps(result).encode()))
+                with patch('sys.stdin', io.StringIO(json.dumps(req))), \
+                     patch.dict('os.environ', {"SCENE_CAP_AUTH": "secret", "JEV_ENDPOINT": "http://mock.invalid/gateway"}), \
+                     patch('urllib.request.urlopen', transport):
+                    jev.main()
+                request = transport.call_args.args[0]
+                self.assertEqual(json.loads(request.data)['system'], task)
+                self.assertEqual(json.loads(output.read_text()), result)
+
 
 if __name__ == '__main__':
     unittest.main()

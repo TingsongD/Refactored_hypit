@@ -98,11 +98,32 @@ impl Response {
     }
 }
 
+/// A total request deadline also bounds clients that trickle one byte at a time.
+struct RequestReader<'a> {
+    stream: &'a mut TcpStream,
+    deadline: std::time::Instant,
+}
+impl Read for RequestReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(bytes)
+    }
+}
+
 fn handle(mut stream: TcpStream, dir: &Path) {
     // A stalled client must not hang the serial server.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
-    let (res, is_head) = match read_request(&mut stream) {
+    let request = read_request(&mut RequestReader {
+        stream: &mut stream,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+    });
+    let (res, is_head) = match request {
         Ok(Some(req)) => (route(&req, dir), req.method == "HEAD"),
         Ok(None) => return,
         Err(error) => {

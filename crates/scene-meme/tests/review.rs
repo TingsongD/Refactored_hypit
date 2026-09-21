@@ -107,3 +107,39 @@ fn embedding_cache_shape_and_values_are_checked() {
         assert!(bad.validate(1, 1).is_err());
     }
 }
+
+#[test]
+fn snapping_switches_and_onset_threshold_are_independent() {
+    let mut p = fixture();
+    p.frames[20].change = 0.8;
+    p.frames[21].sharpness = 0.99;
+    p.audio[22].flux = 1.0;
+    p.audio[22].onset = 1.0;
+    p.audio[22].silence = false;
+    let base = Brief::default();
+    let snapped = pick_peaks(&p, None, &base, &[]);
+    assert!(snapped.iter().any(|c| c.frame == 21 && c.t == 22.0 / 30.0));
+    let no_onset = Brief {
+        snap_to_onset: false,
+        ..base.clone()
+    };
+    assert!(
+        pick_peaks(&p, None, &no_onset, &[])
+            .iter()
+            .any(|c| c.frame == 21 && c.t == 20.0 / 30.0)
+    );
+    let no_sharp = Brief {
+        snap_to_sharp: false,
+        ..base.clone()
+    };
+    assert!(
+        pick_peaks(&p, None, &no_sharp, &[])
+            .iter()
+            .any(|c| c.frame == 20 && c.t == 22.0 / 30.0)
+    );
+    let mut quiet = fixture();
+    quiet.audio[20].flux = 1.0;
+    quiet.audio[20].onset = 0.2;
+    quiet.audio[20].silence = false;
+    assert!(pick_peaks(&quiet, None, &base, &[]).is_empty());
+}

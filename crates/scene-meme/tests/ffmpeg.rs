@@ -227,7 +227,7 @@ assert pathlib.Path({marker:?}).exists(), 'preflight must arrive before provider
 p=req['params']
 assert p['model']=='offline-model'
 assert all('representative_t' in k and 'word' in k and 'onset' in k for k in p['keeps'])
-pathlib.Path(req['out']).write_text(json.dumps({{'beats':[{{'id':k['id'],'t':k['t']}} for k in p['keeps']], 'usage':{{'input_tokens':100,'output_tokens':20}}}}))
+pathlib.Path(req['out']).write_text(json.dumps({{'beats':[{{'id':k['id'],'t':k['t'],'note':p['mode']}} for k in p['keeps']], 'usage':{{'input_tokens':100,'output_tokens':20}}}}))
 "#, marker=marker.to_string_lossy())).unwrap();
     let python = if cfg!(windows) { "python" } else { "python3" };
     let config = format!(
@@ -250,7 +250,7 @@ pathlib.Path(req['out']).write_text(json.dumps({{'beats':[{{'id':k['id'],'t':k['
         ..Brief::default()
     };
     let out = dir.join("out");
-    let execute = |brief: &Brief| {
+    let execute = |brief: &Brief, retry: Option<String>| {
         let mut phases = Vec::new();
         let result = run_with_progress(
             &RunOpts {
@@ -262,7 +262,7 @@ pathlib.Path(req['out']).write_text(json.dumps({{'beats':[{{'id':k['id'],'t':k['
                 beat_sec: 0.2,
                 materialize: false,
                 gemini_mode: scene_meme::gemini::GeminiMode::Stills,
-                rerun_window: None,
+                rerun_window: retry,
                 music_src: None,
             },
             &mut |event| {
@@ -275,7 +275,7 @@ pathlib.Path(req['out']).write_text(json.dumps({{'beats':[{{'id':k['id'],'t':k['
         .unwrap();
         (result, phases)
     };
-    let (first, phases) = execute(&brief);
+    let (first, phases) = execute(&brief, None);
     assert!(first.keeps.len() >= 2);
     let events: Vec<_> = phases.iter().filter(|e| e.0 == "gemini").collect();
     assert_eq!(events[0].1, "preflight");
@@ -288,17 +288,169 @@ pathlib.Path(req['out']).write_text(json.dumps({{'beats':[{{'id':k['id'],'t':k['
     assert_eq!(usage.input_tokens, Some(100));
     assert_eq!(usage.output_tokens, Some(20));
     assert!((usage.estimated_cost_usd.unwrap() - 0.00014).abs() < 1e-9);
-    let (_, phases) = execute(&brief);
+    let (_, phases) = execute(&brief, None);
     assert!(phases.iter().any(|e| e.0 == "gemini" && e.2));
+    let id = first.keeps[0].clone();
+    let (retried, _) = execute(&brief, Some(id.clone()));
+    let analysis = retried.gemini.unwrap();
+    assert_eq!(
+        analysis.beats.iter().find(|b| b.id == id).unwrap().note,
+        "windows"
+    );
+    assert!(
+        analysis
+            .beats
+            .iter()
+            .filter(|b| b.id != id)
+            .all(|b| b.note == "stills")
+    );
+    let (cached, _) = execute(&brief, None);
+    assert_eq!(
+        cached
+            .gemini
+            .unwrap()
+            .beats
+            .iter()
+            .find(|b| b.id == id)
+            .unwrap()
+            .note,
+        "windows"
+    );
     brief.gemini_fps = 12.0;
-    let (_, phases) = execute(&brief);
+    let (_, phases) = execute(&brief, None);
     assert!(phases.iter().any(|e| e.1 == "preflight"));
     std::fs::write(
         &script,
         std::fs::read_to_string(&script).unwrap() + "\n# changed adapter\n",
     )
     .unwrap();
-    let (_, phases) = execute(&brief);
+    let (_, phases) = execute(&brief, None);
     assert!(phases.iter().any(|e| e.1 == "preflight"));
+    brief.description = "cold targeted retry".into();
+    let (partial, _) = execute(&brief, Some(id));
+    assert_eq!(partial.gemini.unwrap().beats.len(), 1);
+    assert_eq!(
+        partial.decision.package,
+        scene_meme::package::Package::NeedMorePeaks
+    );
+    let (complete, phases) = execute(&brief, None);
+    assert_eq!(complete.gemini.unwrap().beats.len(), complete.keeps.len());
+    assert!(
+        phases.iter().any(|e| e.1 == "preflight"),
+        "partial retry must not masquerade as a complete cache hit"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn still_uses_representative_not_beat_timestamp() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tempdir("sharp-still");
+    let clip = make_av_clip(&dir);
+    let mut candidate = keep(0);
+    candidate.representative_t = 0.5;
+    let files = materialize_stills(&clip, &[&candidate], &dir.join("stills")).unwrap();
+    let expected = dir.join("expected.png");
+    assert!(
+        Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-ss", "0.5", "-i"])
+            .arg(&clip)
+            .args(["-frames:v", "1", "-f", "image2"])
+            .arg(&expected)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(&files[0].file).unwrap(),
+        std::fs::read(expected).unwrap()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn embedding_cache_tracks_vocabulary_resolution_model_checkpoint_and_grid() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tempdir("embedding-inputs");
+    let clip = make_av_clip(&dir);
+    let script = dir.join("embed.py");
+    std::fs::write(&script,r#"
+import json,sys,math,pathlib
+req=json.load(sys.stdin); p=req['params']
+rows=[[math.cos(i),math.sin(i)] for i in range(round(p['fps']))]
+pathlib.Path(req['out']).write_text(json.dumps({'embeddings':rows,'vocab_embeddings':[[1,0] for _ in p['vocab']]}))
+"#).unwrap();
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let registry = scene_cap::Registry::from_toml(&format!(
+        "[capabilities.embed]\ncommand=[{},{}]",
+        serde_json::to_string(python).unwrap(),
+        serde_json::to_string(&script).unwrap()
+    ))
+    .unwrap();
+    let base = Brief {
+        encoder: "embed".into(),
+        ..Brief::default()
+    };
+    let out = dir.join("out");
+    let run = |brief: &Brief| {
+        scene_meme::run::run(&scene_meme::run::RunOpts {
+            input: &clip,
+            brief,
+            out: &out,
+            timings: TimingMap::default(),
+            registry: Some(&registry),
+            beat_sec: 0.2,
+            materialize: false,
+            gemini_mode: scene_meme::gemini::GeminiMode::Stills,
+            rerun_window: None,
+            music_src: None,
+        })
+        .unwrap()
+    };
+    let hit = |report: &scene_meme::run::RunReport| {
+        report
+            .stages
+            .iter()
+            .find(|s| s.stage == "embed")
+            .unwrap()
+            .cache_hit
+    };
+    assert!(!hit(&run(&base)));
+    assert!(hit(&run(&base)));
+    for changed in [
+        Brief {
+            tag_vocab: vec!["new label".into()],
+            ..base.clone()
+        },
+        Brief {
+            perceive_size: 128,
+            ..base.clone()
+        },
+        Brief {
+            embedding_model: Some("mock-alternative".into()),
+            ..base.clone()
+        },
+        Brief {
+            weights_id: Some("mock-checkpoint".into()),
+            ..base.clone()
+        },
+        Brief {
+            fps: 15.0,
+            ..base.clone()
+        },
+    ] {
+        assert!(!hit(&run(&changed)));
+        assert!(hit(&run(&changed)));
+    }
+    std::fs::write(
+        &script,
+        std::fs::read_to_string(&script).unwrap() + "\n# implementation changed",
+    )
+    .unwrap();
+    assert!(!hit(&run(&base)));
     let _ = std::fs::remove_dir_all(dir);
 }

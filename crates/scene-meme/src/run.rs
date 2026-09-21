@@ -96,10 +96,53 @@ fn key(stage: &str, value: &impl Serialize) -> String {
     )
 }
 
+/// Preserve endpoint selectors while omitting conventional credential parameters.
+fn endpoint_identity(endpoint: &str) -> String {
+    let endpoint = endpoint.split('#').next().unwrap_or(endpoint);
+    let (base, query) = endpoint.split_once('?').unwrap_or((endpoint, ""));
+    let base = if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        format!(
+            "{scheme}://{}/{path}",
+            authority.rsplit('@').next().unwrap_or(authority)
+        )
+    } else {
+        base.to_string()
+    };
+    let query = query
+        .split('&')
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or("").to_ascii_lowercase();
+            !matches!(
+                key.as_str(),
+                "key"
+                    | "api_key"
+                    | "apikey"
+                    | "token"
+                    | "access_token"
+                    | "authorization"
+                    | "password"
+                    | "signature"
+                    | "x-goog-api-key"
+                    | "x-amz-signature"
+                    | "x-amz-credential"
+                    | "x-amz-security-token"
+            )
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{query}")
+    }
+}
+
 /// The request contract and connector implementation are inputs; auth values are not.
 fn connector_identity(registry: Option<&Registry>, name: &str) -> Value {
     match registry.and_then(|r| r.get(name)).map(|c| &c.connector) {
-        Some(Connector::Http { endpoint }) => json!({"endpoint": endpoint.split('?').next()}),
+        Some(Connector::Http { endpoint }) => json!({"endpoint": endpoint_identity(endpoint)}),
         Some(Connector::Subprocess { argv }) => {
             let files: Vec<_> = argv
                 .iter()
@@ -107,7 +150,7 @@ fn connector_identity(registry: Option<&Registry>, name: &str) -> Value {
                 .filter(|arg| arg.is_file())
                 .map(|arg| json!({"path":arg,"sha256":Cache::file_sha256(&arg).ok()}))
                 .collect();
-            json!({"argv":argv,"files":files,"gateway":std::env::var("JEV_ENDPOINT").ok()})
+            json!({"argv":argv,"files":files,"gateway":std::env::var("JEV_ENDPOINT").ok().map(|e|endpoint_identity(&e))})
         }
         None => Value::Null,
     }
@@ -153,6 +196,29 @@ struct GeminiCtx<'a> {
     cache: &'a Cache,
 }
 impl GeminiCtx<'_> {
+    fn cache_key(&self, keeps: &[&Candidate]) -> String {
+        let mode = match self.mode {
+            GeminiMode::Stills => "stills",
+            GeminiMode::Windows => "windows",
+        };
+        key(
+            "gemini",
+            &json!({"video":self.video_sha,"keeps":keeps,"brief":self.brief,
+            "mode":mode,"prompt_version":2,"connector":connector_identity(Some(self.reg), &self.brief.gemini_cap)}),
+        )
+    }
+    fn retry(&self, keep: &Candidate, log: &mut Recorder<'_>) -> Result<GeminiAnalysis, MemeError> {
+        let window = GeminiCtx {
+            mode: GeminiMode::Windows,
+            reg: self.reg,
+            video: self.video,
+            video_sha: self.video_sha,
+            brief: self.brief,
+            out: self.out,
+            cache: self.cache,
+        };
+        window.analyze(&[keep], true, log)
+    }
     fn analyze(
         &self,
         keeps: &[&Candidate],
@@ -163,11 +229,7 @@ impl GeminiCtx<'_> {
             GeminiMode::Stills => "stills",
             GeminiMode::Windows => "windows",
         };
-        let cache_key = key(
-            "gemini",
-            &json!({"video":self.video_sha,"keeps":keeps,"brief":self.brief,
-            "mode":mode,"prompt_version":2,"connector":connector_identity(Some(self.reg), &self.brief.gemini_cap)}),
-        );
+        let cache_key = self.cache_key(keeps);
         let started = Instant::now();
         if !force && let Some(a) = self.cache.get::<GeminiAnalysis>(&cache_key) {
             log.record("gemini", started, true, format!("{} {mode}", keeps.len()));
@@ -209,7 +271,9 @@ impl GeminiCtx<'_> {
             &files,
             staging.path(),
         )?;
-        if result.beats.is_empty()
+        let distinct: std::collections::BTreeSet<_> = result.beats.iter().map(|b| &b.id).collect();
+        if distinct.len() != keeps.len()
+            || distinct.len() != result.beats.len()
             || result
                 .beats
                 .iter()
@@ -394,7 +458,13 @@ pub fn run_with_progress(
         cache: &cache,
     });
     let mut analysis = match &ctx {
-        Some(ctx) if !keeps.is_empty() => Some(ctx.analyze(&keeps, false, &mut log)?),
+        Some(ctx) if !keeps.is_empty() => {
+            if opts.rerun_window.is_some() {
+                ctx.cache.get(&ctx.cache_key(&keeps))
+            } else {
+                Some(ctx.analyze(&keeps, false, &mut log)?)
+            }
+        }
         _ => {
             log.record("gemini", Instant::now(), true, "offline or no keeps".into());
             None
@@ -409,10 +479,15 @@ pub fn run_with_progress(
             .copied()
             .find(|k| &k.id == id)
             .ok_or_else(|| MemeError::Stage(format!("rerun window `{id}` is not a keep")))?;
-        let update = ctx.analyze(&[keep], true, &mut log)?;
+        let update = ctx.retry(keep, &mut log)?;
         analysis
             .get_or_insert_with(Default::default)
             .merge_window(id, update);
+        if let Some(a) = &analysis
+            && keeps.iter().all(|k| a.beats.iter().any(|b| b.id == k.id))
+        {
+            ctx.cache.put(&ctx.cache_key(&keeps), a)?;
+        }
     }
     let decide = |analysis: &Option<GeminiAnalysis>,
                   log: &mut Recorder<'_>|
@@ -445,11 +520,23 @@ pub fn run_with_progress(
                 "rerun_window named unknown keep `{keep_id}`"
             )));
         };
-        let update = ctx.analyze(&[keep], true, &mut log)?;
+        let update = ctx.retry(keep, &mut log)?;
         analysis
             .get_or_insert_with(Default::default)
             .merge_window(keep_id, update);
+        if let Some(a) = &analysis
+            && keeps.iter().all(|k| a.beats.iter().any(|b| b.id == k.id))
+        {
+            ctx.cache.put(&ctx.cache_key(&keeps), a)?;
+        }
         decision = decide(&analysis, &mut log)?;
+    }
+    if analysis
+        .as_ref()
+        .is_some_and(|a| keeps.iter().any(|k| !a.beats.iter().any(|b| b.id == k.id)))
+    {
+        decision.package = Package::NeedMorePeaks;
+        decision.note = "partial window analysis; run the full analysis before export".into();
     }
     if !outcome.low_confidence.is_empty() && decision.package == Package::Export {
         decision.package = Package::NeedMorePeaks;
@@ -513,4 +600,20 @@ pub fn run_with_progress(
     };
     write_json(opts.out, "report", &report)?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn endpoint_selectors_invalidate_cache_but_credentials_do_not() {
+        assert_ne!(
+            endpoint_identity("https://service/analyze?model=a"),
+            endpoint_identity("https://service/analyze?model=b")
+        );
+        assert_eq!(
+            endpoint_identity("https://user:secret@service/analyze?model=a&key=one"),
+            endpoint_identity("https://service/analyze?model=a&key=two")
+        );
+    }
 }

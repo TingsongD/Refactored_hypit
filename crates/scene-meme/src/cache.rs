@@ -150,3 +150,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[test]
+    fn failed_json_publication_preserves_existing_file_and_old_namespace() {
+        let dir = std::env::temp_dir().join(format!("meme-publication-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".cache")).unwrap();
+        let path = dir.join("report.json");
+        fs::write(&path, b"old report").unwrap();
+        assert!(write_atomic(&path, b"").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old report");
+        let old = dir.join(".cache/entry.json");
+        fs::write(&old, b"42").unwrap();
+        assert!(Cache::new(&dir).get::<u32>("entry").is_none());
+        assert!(old.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+}

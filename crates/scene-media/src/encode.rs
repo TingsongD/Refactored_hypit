@@ -7,13 +7,13 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::time::Duration;
 
 use scene_ir::Rational;
 
 use crate::error::{MediaError, Tool};
-use crate::proc::{spawn_grouped, wait_timeout};
+use crate::proc::{StreamingChild, wait_stream};
 use crate::stderr::StderrDrain;
 use crate::watchdog::{Heartbeat, StallWatchdog, heartbeat, watch_io};
 
@@ -30,7 +30,7 @@ const FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 /// `write_frame` takes one `w*h*3/2` NV12 buffer. `finish` closes the
 /// pipe and waits for the muxer; dropping without finishing kills it.
 pub struct Encoder {
-    child: Child,
+    child: StreamingChild,
     stdin: Option<ChildStdin>,
     /// stderr drains on a thread so a chatty encoder can't fill the pipe
     /// and deadlock against our stdin writes.
@@ -92,14 +92,14 @@ impl Encoder {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = spawn_grouped(&mut cmd).map_err(|e| MediaError::Spawn {
+        let mut child = StreamingChild::spawn(&mut cmd).map_err(|e| MediaError::Spawn {
             tool: "ffmpeg",
             source: e,
         })?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stderr = StderrDrain::start(child.stderr.take().expect("stderr was piped"));
         let heartbeat = heartbeat();
-        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), STALL_LIMIT);
+        let watchdog = child.watchdog(heartbeat.clone(), STALL_LIMIT);
         Ok(Encoder {
             child,
             stdin: Some(stdin),
@@ -139,7 +139,7 @@ impl Encoder {
         // No more writes — the heartbeat would go stale during a legit
         // mux. Disarm the stall check; teardown gets a fixed deadline.
         self.watchdog.disarm();
-        let status = wait_timeout(&mut self.child, "ffmpeg", FINISH_TIMEOUT)?;
+        let status = wait_stream(&mut self.child, &mut self.stderr, "ffmpeg", FINISH_TIMEOUT)?;
         self.finished = true;
         if !status.success() {
             return Err(self.failed_status(status));
@@ -149,6 +149,8 @@ impl Encoder {
 
     fn child_failed(&mut self) -> MediaError {
         self.watchdog.disarm();
+        let _ = self.child.kill();
+        let _ = wait_stream(&mut self.child, &mut self.stderr, "ffmpeg", FINISH_TIMEOUT);
         let status = self
             .child
             .try_wait()
@@ -184,9 +186,7 @@ impl Drop for Encoder {
             return;
         }
         drop(self.stdin.take());
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -327,11 +327,11 @@ mod tests {
         let (reader, writer) = std::io::pipe().unwrap();
         drop(writer); // EOF — the drain thread exits, so Drop::join returns
         #[cfg(unix)]
-        let child = Command::new("true").spawn().unwrap();
+        let child = StreamingChild::spawn(&mut Command::new("true")).unwrap();
         #[cfg(windows)]
-        let child = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+        let child = StreamingChild::spawn(Command::new("cmd").args(["/C", "exit 0"])).unwrap();
         let heartbeat = heartbeat();
-        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), Duration::from_secs(3600));
+        let watchdog = child.watchdog(heartbeat.clone(), Duration::from_secs(3600));
         let mut enc = Encoder {
             child,
             stdin: None,

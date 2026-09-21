@@ -63,6 +63,195 @@ fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// A streaming process group owned by a manager thread. The retained Windows Job
+/// and Unix group survive leader exit; watchdog cancellation never relies on a
+/// recycled PID. Pipe I/O happens on the caller, independently of this manager.
+pub(crate) struct StreamingChild {
+    commands: std::sync::mpsc::Sender<StreamCommand>,
+    manager: Option<std::thread::JoinHandle<()>>,
+    completed: Option<ExitStatus>,
+    pub stdin: Option<std::process::ChildStdin>,
+    pub stdout: Option<std::process::ChildStdout>,
+    pub stderr: Option<std::process::ChildStderr>,
+}
+
+enum StreamCommand {
+    Poll(std::sync::mpsc::Sender<std::io::Result<Option<ExitStatus>>>),
+    Kill,
+    Stop,
+}
+
+/// Observe Unix exit without reaping, retaining the group leader's PID until
+/// group cleanup. Windows Job handles provide that lifetime independently.
+fn stream_status(child: &mut command_group::GroupChild) -> std::io::Result<Option<ExitStatus>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: waitid initializes the supplied siginfo; WNOWAIT keeps the
+        // owned child waitable and prevents PID reuse before group cleanup.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let info = unsafe { info.assume_init() };
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        let status = unsafe { info.si_status() };
+        let raw = if info.si_code == libc::CLD_EXITED {
+            status << 8
+        } else if info.si_code == libc::CLD_DUMPED {
+            status | 0x80
+        } else {
+            status
+        };
+        Ok(Some(ExitStatus::from_raw(raw)))
+    }
+    #[cfg(not(unix))]
+    {
+        child.inner().try_wait()
+    }
+}
+
+impl StreamingChild {
+    pub fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        let mut cmd = std::mem::replace(cmd, Command::new("consumed-stream-command"));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (commands, requests) = std::sync::mpsc::channel();
+        let manager = std::thread::spawn(move || {
+            let mut group = cmd.group();
+            #[cfg(windows)]
+            group.kill_on_drop(true);
+            let mut child = match group.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            let pipes = (
+                child.inner().stdin.take(),
+                child.inner().stdout.take(),
+                child.inner().stderr.take(),
+            );
+            if ready_tx.send(Ok(pipes)).is_ok() {
+                while let Ok(command) = requests.recv() {
+                    match command {
+                        StreamCommand::Poll(reply) => {
+                            let _ = reply.send(stream_status(&mut child));
+                        }
+                        StreamCommand::Kill => {
+                            let _ = child.kill();
+                        }
+                        StreamCommand::Stop => break,
+                    }
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let (stdin, stdout, stderr) = ready_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("stream manager exited"))??;
+        Ok(Self {
+            commands,
+            manager: Some(manager),
+            completed: None,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+    pub fn watchdog(
+        &self,
+        heart: crate::watchdog::Heartbeat,
+        limit: Duration,
+    ) -> crate::watchdog::StallWatchdog {
+        let commands = self.commands.clone();
+        crate::watchdog::StallWatchdog::arm_action(heart, limit, move || {
+            let _ = commands.send(StreamCommand::Kill);
+        })
+    }
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.completed.is_some() {
+            return Ok(self.completed);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.commands
+            .send(StreamCommand::Poll(tx))
+            .map_err(|_| std::io::Error::other("stream manager exited"))?;
+        rx.recv()
+            .map_err(|_| std::io::Error::other("stream manager exited"))?
+    }
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        if self.completed.is_some() {
+            return Ok(());
+        }
+        self.commands
+            .send(StreamCommand::Kill)
+            .map_err(|_| std::io::Error::other("stream manager exited"))
+    }
+    fn finish(&mut self, status: ExitStatus) {
+        let _ = self.commands.send(StreamCommand::Stop);
+        if let Some(manager) = self.manager.take() {
+            let _ = manager.join();
+        }
+        self.completed = Some(status);
+    }
+    pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+impl Drop for StreamingChild {
+    fn drop(&mut self) {
+        let _ = self.commands.send(StreamCommand::Stop);
+        if let Some(manager) = self.manager.take() {
+            let _ = manager.join();
+        }
+    }
+}
+
+/// Finish includes stderr EOF, not merely leader exit.
+pub(crate) fn wait_stream(
+    child: &mut StreamingChild,
+    stderr: &mut StderrDrain,
+    tool: &'static str,
+    limit: Duration,
+) -> Result<ExitStatus, MediaError> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()?
+            && stderr.is_finished()
+        {
+            stderr.join();
+            child.finish(status);
+            return Ok(status);
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            if let Ok(status) = child.wait() {
+                child.finish(status);
+            }
+            stderr.join();
+            return Err(MediaError::TimedOut { tool, limit });
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Wait for `child` up to `limit`. On expiry the child — and its
 /// descendants, when spawned via [`spawn_grouped`] — is killed and
 /// reaped (no zombie), and the error names the tool and the deadline.
@@ -346,5 +535,40 @@ mod tests {
         // host init promptly reaping orphaned zombie processes.
         rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         drain.join().unwrap();
+    }
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn stderr_descendant_fixture() {
+        let _child = fixture("proc::tests::pipe_holder_fixture")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        std::process::exit(0);
+    }
+    #[test]
+    fn streaming_deadline_covers_descendant_stderr_after_leader_exit() {
+        let mut child = StreamingChild::spawn(
+            fixture("proc::tests::stderr_descendant_fixture")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        let mut stderr = StderrDrain::start(child.stderr.take().unwrap());
+        let started = Instant::now();
+        assert!(matches!(
+            wait_stream(
+                &mut child,
+                &mut stderr,
+                "fixture",
+                Duration::from_millis(150)
+            ),
+            Err(MediaError::TimedOut { .. })
+        ));
+        drop(child);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(stderr.is_finished());
     }
 }

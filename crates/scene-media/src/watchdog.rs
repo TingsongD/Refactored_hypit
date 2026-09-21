@@ -53,6 +53,14 @@ pub struct StallWatchdog {
 
 impl StallWatchdog {
     pub fn arm(pid: u32, heart: Heartbeat, stall: Duration) -> Self {
+        Self::arm_action(heart, stall, move || kill_pid(pid))
+    }
+
+    pub(crate) fn arm_action(
+        heart: Heartbeat,
+        stall: Duration,
+        kill: impl FnOnce() + Send + 'static,
+    ) -> Self {
         let watched = heart.clone();
         let thread = std::thread::spawn(move || {
             let (lock, changed) = &*watched.0;
@@ -63,7 +71,7 @@ impl StallWatchdog {
                     if elapsed >= stall {
                         // Serialize expiry with IoGuard::drop, so a completed
                         // operation cannot race a stale snapshot into a kill.
-                        kill_pid(pid);
+                        kill();
                         return;
                     }
                     state = changed.wait_timeout(state, stall - elapsed).unwrap().0;
