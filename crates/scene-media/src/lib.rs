@@ -18,7 +18,7 @@ mod stderr;
 mod watchdog;
 
 pub use confine::{Escapes, confine_under_root};
-pub use decode::{Frame, FrameStream};
+pub use decode::{DecodeWindow, Frame, FrameStream};
 pub use encode::Encoder;
 pub use error::{MediaError, Tool};
 pub use output::StagedOutput;

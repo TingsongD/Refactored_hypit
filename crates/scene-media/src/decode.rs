@@ -38,6 +38,13 @@ impl Frame {
     }
 }
 
+/// Source-time interval `[start_s, end_s)` for scaled decoding.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeWindow {
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
 /// Streams decoded frames from an ffmpeg subprocess. Dropping kills the
 /// child (closing stdout makes ffmpeg exit on its own; we reap it anyway).
 pub struct FrameStream {
@@ -73,13 +80,56 @@ impl FrameStream {
         height: u32,
         fps: f64,
     ) -> Result<Self, MediaError> {
-        Self::spawn(
-            path,
-            info,
-            &[],
-            Some(format!("scale={width}:{height},fps={fps}")),
-            (width, height),
-        )
+        Self::open_scaled_window(path, info, width, height, fps, None)
+    }
+
+    /// Decode a half-open source-time window, with window-local frame indices.
+    /// Keep one second of preroll so the fps filter retains the source grid.
+    pub fn open_scaled_window(
+        path: &Path,
+        info: &MediaInfo,
+        width: u32,
+        height: u32,
+        fps: f64,
+        window: Option<DecodeWindow>,
+    ) -> Result<Self, MediaError> {
+        let invalid = |message| {
+            MediaError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ))
+        };
+        if width == 0 || height == 0 || !fps.is_finite() || fps <= 0.0 {
+            return Err(invalid(
+                "scaled dimensions and fps must be positive and finite",
+            ));
+        }
+        let mut filter = format!("scale={width}:{height},fps={fps}");
+        let mut args = Vec::new();
+        if let Some(window) = window {
+            if !window.start_s.is_finite()
+                || !window.end_s.is_finite()
+                || window.start_s < 0.0
+                || window.end_s <= window.start_s
+            {
+                return Err(invalid(
+                    "decode window must be finite, nonnegative, and nonempty",
+                ));
+            }
+            args = vec![
+                "-copyts".to_string(),
+                "-ss".to_string(),
+                (window.start_s.floor() - 1.0).max(0.0).to_string(),
+                "-to".to_string(),
+                window.end_s.to_string(),
+            ];
+            filter.push_str(&format!(
+                ",trim=start={}:end={},setpts=PTS-STARTPTS",
+                window.start_s, window.end_s
+            ));
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        Self::spawn(path, info, &refs, Some(filter), (width, height))
     }
 
     /// Open with a caller-supplied probe result plus extra ffmpeg input

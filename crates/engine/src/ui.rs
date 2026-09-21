@@ -102,15 +102,27 @@ fn handle(mut stream: TcpStream, dir: &Path) {
     // A stalled client must not hang the serial server.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
-    let req = match read_request(&mut stream) {
-        Ok(Some(r)) => r,
-        _ => return, // unreadable/empty request — just close
+    let (res, is_head) = match read_request(&mut stream) {
+        Ok(Some(req)) => (route(&req, dir), req.method == "HEAD"),
+        Ok(None) => return,
+        Err(error) => {
+            let status = match error.kind() {
+                std::io::ErrorKind::FileTooLarge => 413,
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => 408,
+                _ => 400,
+            };
+            (
+                Response::new(status, "text/plain", error.to_string().into_bytes()),
+                false,
+            )
+        }
     };
-    let res = route(&req, dir);
     let status_text = match res.status {
         200 => "200 OK",
         206 => "206 Partial Content",
         400 => "400 Bad Request",
+        408 => "408 Request Timeout",
+        413 => "413 Content Too Large",
         403 => "403 Forbidden",
         404 => "404 Not Found",
         415 => "415 Unsupported Media Type",
@@ -126,7 +138,7 @@ fn handle(mut stream: TcpStream, dir: &Path) {
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes());
-    if req.method == "HEAD" {
+    if is_head {
         return;
     }
     match res.body {
@@ -155,61 +167,202 @@ fn handle(mut stream: TcpStream, dir: &Path) {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
-    let head_end;
+fn bad_request(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn too_large() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::FileTooLarge, "request exceeds limit")
+}
+
+fn read_line(reader: &mut impl Read, budget: &mut usize) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
     loop {
-        if buf.len() > MAX_HEAD {
-            return Ok(None);
+        if *budget == 0 {
+            return Err(too_large());
         }
-        match stream.read(&mut tmp)? {
-            0 => return Ok(None),
-            n => {
-                buf.extend_from_slice(&tmp[..n]);
-                if let Some(pos) = find(&buf, b"\r\n\r\n") {
-                    head_end = pos + 4;
-                    break;
+        let mut byte = [0];
+        reader.read_exact(&mut byte)?;
+        *budget -= 1;
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            if !bytes.ends_with(b"\r\n") {
+                return Err(bad_request("expected CRLF"));
+            }
+            bytes.truncate(bytes.len() - 2);
+            return String::from_utf8(bytes).map_err(|_| bad_request("invalid header encoding"));
+        }
+    }
+}
+
+fn header(line: &str) -> std::io::Result<(String, String)> {
+    let (name, value) = line
+        .split_once(':')
+        .ok_or_else(|| bad_request("invalid header"))?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        || value.bytes().any(|b| b < 32 && b != b'\t' || b == 127)
+    {
+        return Err(bad_request("invalid header"));
+    }
+    Ok((name.to_ascii_lowercase(), value.trim().to_string()))
+}
+
+fn valid_chunk_extensions(mut input: &str) -> bool {
+    fn token(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+    while !input.is_empty() {
+        let Some(rest) = input.strip_prefix(';') else {
+            return false;
+        };
+        input = rest.trim_start_matches([' ', '\t']);
+        let n = input.bytes().take_while(|b| token(*b)).count();
+        if n == 0 {
+            return false;
+        }
+        input = input[n..].trim_start_matches([' ', '\t']);
+        if let Some(rest) = input.strip_prefix('=') {
+            input = rest.trim_start_matches([' ', '\t']);
+            if let Some(rest) = input.strip_prefix('"') {
+                let mut escaped = false;
+                let mut end = None;
+                for (i, byte) in rest.bytes().enumerate() {
+                    if byte < 32 && byte != b'\t' || byte == 127 {
+                        return false;
+                    }
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        end = Some(i);
+                        break;
+                    }
                 }
+                let Some(end) = end else {
+                    return false;
+                };
+                input = &rest[end + 1..];
+            } else {
+                let n = input.bytes().take_while(|b| token(*b)).count();
+                if n == 0 {
+                    return false;
+                }
+                input = &input[n..];
             }
+            input = input.trim_start_matches([' ', '\t']);
         }
     }
-    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-    let mut lines = head.lines();
-    let mut parts = lines.next().unwrap_or("").split_whitespace();
-    let (method, path) = match (parts.next(), parts.next()) {
-        (Some(m), Some(p)) => (m.to_string(), p.to_string()),
-        _ => return Ok(None),
-    };
+    true
+}
+
+fn read_request(stream: &mut impl Read) -> std::io::Result<Option<Request>> {
+    let mut reader = std::io::BufReader::new(stream);
+    let mut budget = MAX_HEAD;
+    let line = read_line(&mut reader, &mut budget)?;
+    let parts: Vec<_> = line.split(' ').collect();
+    if parts.len() != 3
+        || !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1")
+        || parts[0].is_empty()
+        || !parts[1].starts_with('/')
+    {
+        return Err(bad_request("invalid request line"));
+    }
+    let (method, path) = (parts[0].to_string(), parts[1].to_string());
     let mut headers = Vec::new();
-    let mut content_len = 0usize;
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            let (k, v) = (k.trim().to_lowercase(), v.trim().to_string());
-            if k == "content-length" {
-                content_len = v.parse().unwrap_or(0).min(MAX_BODY);
+    let mut length = None;
+    let mut chunked = false;
+    loop {
+        let line = read_line(&mut reader, &mut budget)?;
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = header(&line)?;
+        match name.as_str() {
+            "content-length" => {
+                if length.is_some()
+                    || value.is_empty()
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(bad_request("invalid or repeated content-length"));
+                }
+                let n = value.parse::<usize>().map_err(|_| too_large())?;
+                if n > MAX_BODY {
+                    return Err(too_large());
+                }
+                length = Some(n);
             }
-            headers.push((k, v));
+            "transfer-encoding" => {
+                if chunked || !value.eq_ignore_ascii_case("chunked") {
+                    return Err(bad_request("unsupported transfer-encoding"));
+                }
+                chunked = true;
+            }
+            _ => {}
         }
+        headers.push((name, value));
     }
-    let mut body = buf.split_off(head_end);
-    while body.len() < content_len {
-        match stream.read(&mut tmp)? {
-            0 => break,
-            n => body.extend_from_slice(&tmp[..n]),
+    if chunked && length.is_some() {
+        return Err(bad_request("conflicting request framing"));
+    }
+    let mut body = Vec::new();
+    if chunked {
+        let mut framing_budget = MAX_HEAD;
+        loop {
+            let mut line_budget = 8192.min(framing_budget);
+            let before = line_budget;
+            let line = read_line(&mut reader, &mut line_budget)?;
+            framing_budget -= before - line_budget;
+            let size = line.split(';').next().unwrap_or("");
+            if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(bad_request("invalid chunk size"));
+            }
+            if !valid_chunk_extensions(&line[size.len()..]) {
+                return Err(bad_request("invalid chunk extension"));
+            }
+            let n = usize::from_str_radix(size, 16).map_err(|_| too_large())?;
+            if n > MAX_BODY - body.len() {
+                return Err(too_large());
+            }
+            if n == 0 {
+                let mut budget = MAX_HEAD;
+                loop {
+                    let line = read_line(&mut reader, &mut budget)?;
+                    if line.is_empty() {
+                        break;
+                    }
+                    let (name, _) = header(&line)?;
+                    if matches!(
+                        name.as_str(),
+                        "content-length" | "transfer-encoding" | "host"
+                    ) {
+                        return Err(bad_request("forbidden framing trailer"));
+                    }
+                }
+                break;
+            }
+            let old = body.len();
+            body.resize(old + n, 0);
+            reader.read_exact(&mut body[old..])?;
+            let mut ending = [0; 2];
+            reader.read_exact(&mut ending)?;
+            if ending != *b"\r\n" {
+                return Err(bad_request("invalid chunk ending"));
+            }
         }
+    } else {
+        body.resize(length.unwrap_or(0), 0);
+        reader.read_exact(&mut body)?;
     }
-    body.truncate(content_len);
     Ok(Some(Request {
         method,
         path,
         headers,
         body,
     }))
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 fn url_decode(s: &str) -> String {
@@ -706,5 +859,73 @@ mod tests {
         assert_eq!(content_type("b.wav"), "audio/wav");
         assert_eq!(content_type("c.png"), "image/png");
         assert_eq!(content_type("d.bin"), "application/octet-stream");
+    }
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+    fn parse(bytes: &[u8]) -> std::io::Result<Option<Request>> {
+        read_request(&mut &bytes[..])
+    }
+    #[test]
+    fn chunks_extensions_trailers_and_fragmentation() {
+        struct Fragments<'a>(&'a [u8]);
+        impl Read for Fragments<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = out.len().min(self.0.len()).min(1);
+                out[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let bytes = b"POST /api/check HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3;name=value\r\nabc\r\n2\r\nde\r\n0\r\nX-Checksum: yes\r\n\r\n";
+        let req = read_request(&mut Fragments(bytes)).unwrap().unwrap();
+        assert_eq!(req.body, b"abcde");
+    }
+    #[test]
+    fn invalid_framing_is_rejected() {
+        for bytes in [
+            "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n",
+            "Content-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            "Content-Length: invalid\r\n\r\n",
+            "Content-Length: 2\r\n\r\nx",
+            "Transfer-Encoding: gzip, chunked\r\n\r\n",
+            "Transfer-Encoding: chunked\r\n\r\nZ\r\n",
+            "Transfer-Encoding: chunked\r\n\r\n2\r\nx",
+            "Transfer-Encoding: chunked\r\n\r\n1\r\nxXX0\r\n\r\n",
+            "Transfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            assert!(
+                parse(format!("POST / HTTP/1.1\r\n{bytes}").as_bytes()).is_err(),
+                "{bytes}"
+            );
+        }
+    }
+    #[test]
+    fn oversize_and_timeout_are_errors() {
+        for tail in [
+            format!("Content-Length: {}\r\n\r\n", MAX_BODY + 1),
+            format!("Transfer-Encoding: chunked\r\n\r\n{:x}\r\n", MAX_BODY + 1),
+            format!(
+                "Transfer-Encoding: chunked\r\n\r\n1;{}\r\n",
+                "x".repeat(8192)
+            ),
+        ] {
+            let error = parse(format!("POST / HTTP/1.1\r\n{tail}").as_bytes())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        }
+        struct Timeout;
+        impl Read for Timeout {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::TimedOut.into())
+            }
+        }
+        assert_eq!(
+            read_request(&mut Timeout).err().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 }

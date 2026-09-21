@@ -272,3 +272,69 @@ fn missing_file_is_an_error() {
     let missing = PathBuf::from("/definitely/not/here.mp4");
     assert!(probe(&missing).is_err());
 }
+
+#[test]
+fn scaled_windows_match_sequential_cfr() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tempdir("scaled-window");
+    let path = dir.join("long.mp4");
+    assert!(
+        Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x90:rate=10:duration=3",
+                "-pix_fmt",
+                "yuv420p"
+            ])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let info = probe(&path).unwrap();
+    let all: Vec<_> = FrameStream::open_scaled(&path, &info, 80, 46, 10.0)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let selected: Vec<_> = FrameStream::open_scaled_window(
+        &path,
+        &info,
+        80,
+        46,
+        10.0,
+        Some(scene_media::DecodeWindow {
+            start_s: 2.3,
+            end_s: 2.7,
+        }),
+    )
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+    assert_eq!(selected.len(), 4);
+    for (i, frame) in selected.iter().enumerate() {
+        assert_eq!(frame.index, i as u64);
+        assert_eq!(frame.pixels, all[i + 23].pixels);
+    }
+    for (start_s, end_s) in [(1.0, 0.0), (0.0, f64::INFINITY), (-1.0, 1.0)] {
+        assert!(
+            FrameStream::open_scaled_window(
+                &path,
+                &info,
+                80,
+                46,
+                10.0,
+                Some(scene_media::DecodeWindow { start_s, end_s })
+            )
+            .is_err()
+        );
+    }
+    assert!(FrameStream::open_scaled(&path, &info, 0, 46, f64::NAN).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}

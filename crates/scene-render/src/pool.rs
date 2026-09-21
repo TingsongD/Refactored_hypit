@@ -1,14 +1,14 @@
-//! Frame-parallel rendering: contiguous shards, one `Renderer` per
-//! worker thread, frames streamed to the consumer in index order over
-//! bounded per-shard channels — memory stays flat with duration.
+//! Frame-parallel rendering with a shared ascending queue and bounded ordered
+//! result buffer. Each worker retains its renderer across jobs.
 //!
 //! The determinism contract is the whole point: a frame is a pure
 //! function of (scene, timings, frame index, worker-local resources), so
 //! worker count can change throughput but never bytes. The tests pin it.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use scene_ir::ElementKind;
@@ -41,34 +41,10 @@ pub struct RenderedFrame {
 pub type RendererFactory<'a> =
     dyn Fn(&'a ResolvedScene, &'a TimingMap) -> Renderer<'a> + Send + Sync;
 
-/// Per-shard channel depth — how far a shard's worker may run ahead of
-/// the consumer before its `send` blocks. Frame memory ceiling is
-/// `workers × (SHARD_QUEUE + 1) + 1` frames (queued + the frame each
-/// worker holds mid-render/send + the consumer's current frame): about
-/// 340 MB at 8 workers and 1080×1920, independent of video duration.
-const SHARD_QUEUE: usize = 4;
-
-/// Render `frames` of `scene` across at most `workers` threads,
-/// streaming each frame to `consume` in index order as soon as it is
-/// ready. Returns the number of frames delivered.
-///
-/// Each worker owns a contiguous shard and pushes frames into a small
-/// bounded channel; the caller drains shard 0, then shard 1, and so on —
-/// disjoint ordered ranges make sequential draining ordered
-/// concatenation, so no reorder buffer is needed. Encoding (or any other
-/// consumer) overlaps rendering, and the first frame is consumed while
-/// the last is still being drawn.
-///
-/// `consume` runs on the calling thread, so it may borrow `&mut` state
-/// (an encoder) without `Send`/`'static` bounds. If it returns `Err`,
-/// delivery stops: a cancel flag plus the dropped receivers release
-/// every blocked `send`, all workers are joined, and the initiating
-/// error propagates — frames already consumed are irreversible.
-///
-/// `make_renderer` runs inside each worker thread; `scene`/`timings` are
-/// shared read-only across workers. A worker panic is caught and comes
-/// back as `Err` — a raster bug must not kill the process. (Requires
-/// unwinding: `panic = "abort"` would defeat `catch_unwind`.)
+/// Render an ascending shared queue with at most `4 * workers` outstanding
+/// jobs. Results are delivered in order, including failures. Each worker keeps
+/// its renderer and replays only its unprocessed program prefix/gap.
+/// Consumer failure cancels work, disconnects channels, and joins workers.
 pub fn render_frames_into<'a>(
     scene: &'a ResolvedScene,
     timings: &'a TimingMap,
@@ -82,130 +58,98 @@ pub fn render_frames_into<'a>(
         return Ok(0);
     }
     let workers = workers.clamp(1, total);
-    // Contiguous shards, first workers get the remainder one each.
-    let base = total / workers;
-    let extra = total % workers;
-    // Script state is sequential: a program's `render()` may accumulate
-    // across frames, so a worker that starts mid-range must first replay
-    // the calls a continuous run would have made — otherwise output
-    // changes with the worker count. The replay starts at frame *zero*,
-    // not the window's start: a `--frames 90:120` window still carries
-    // the state built over 0..90 (layout-only, no pixels).
+    let limit = workers.saturating_mul(4).min(total);
     let has_programs = scene_has_programs(scene);
-
-    // Cancellation has two halves: the flag makes workers stop *starting*
-    // work, and dropping the receivers makes any worker blocked in `send`
-    // fail out of it — a blocked sender never observes the flag.
     let cancel = Arc::new(AtomicBool::new(false));
-    // Terminal reports — one per worker, tagged with its shard index, on
-    // a separate channel so a failure isn't queued behind frame traffic.
-    let (ctl_tx, ctl_rx) = mpsc::channel::<(usize, Result<(), String>)>();
-
-    let mut consumed = 0usize;
-    thread::scope(|scope| -> Result<(), String> {
-        // Spawn every worker first so later shards warm up in parallel,
-        // then drain — receiving must happen inside the scope: with
-        // bounded channels, a receive-after-join deadlocks on `send`.
-        let mut receivers = Vec::with_capacity(workers);
-        let mut cursor = frames.start;
-        for w in 0..workers {
-            let len = base + usize::from(w < extra);
-            let shard = cursor..cursor + len as u32;
-            cursor = shard.end;
-            let (tx, rx) = mpsc::sync_channel::<RenderedFrame>(SHARD_QUEUE);
-            receivers.push(rx);
-            let ctl_tx = ctl_tx.clone();
-            let cancel = cancel.clone();
-            scope.spawn(move || {
-                // AssertUnwindSafe: the renderer is thread-local and
-                // dropped during unwind; nothing escapes but the Err.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut renderer = make_renderer(scene, timings);
-                    if has_programs && !cancel.load(Ordering::Relaxed) {
-                        renderer.warm_programs(0..shard.start);
-                    }
-                    for index in shard {
+    thread::scope(|scope| {
+        let result = (|| {
+            let (job_tx, job_rx) = mpsc::channel::<u32>();
+            let job_rx = Arc::new(Mutex::new(job_rx));
+            let (result_tx, result_rx) = mpsc::sync_channel(limit);
+            for worker in 0..workers {
+                let jobs = job_rx.clone();
+                let tx = result_tx.clone();
+                let cancel = cancel.clone();
+                scope.spawn(move || {
+                    let mut renderer = None;
+                    let mut next_program_frame = 0;
+                    loop {
+                        let Ok(index) = jobs.lock().unwrap().recv() else {
+                            break;
+                        };
                         if cancel.load(Ordering::Relaxed) {
-                            return;
+                            break;
                         }
-                        // A dropped receiver means the consumer failed —
-                        // stop rather than render into a dead pipe.
-                        if tx
-                            .send(RenderedFrame {
-                                index,
-                                pixels: renderer.render(index),
-                            })
-                            .is_err()
-                        {
-                            return;
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let renderer =
+                                renderer.get_or_insert_with(|| make_renderer(scene, timings));
+                            if has_programs {
+                                for frame in next_program_frame..index {
+                                    if cancel.load(Ordering::Relaxed) {
+                                        return None;
+                                    }
+                                    renderer.warm_programs(frame..frame + 1);
+                                }
+                            }
+                            if cancel.load(Ordering::Relaxed) {
+                                return None;
+                            }
+                            let pixels = renderer.render(index);
+                            next_program_frame = index + 1;
+                            Some(RenderedFrame { index, pixels })
+                        }))
+                        .map_err(|payload| {
+                            let message = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic".into());
+                            format!("render worker {worker} failed: {message}")
+                        });
+                        let failed = result.is_err();
+                        let result = match result {
+                            Ok(Some(frame)) => Ok(frame),
+                            Ok(None) => break,
+                            Err(e) => Err(e),
+                        };
+                        if tx.send((index, result)).is_err() || failed {
+                            break;
                         }
                     }
-                }))
-                .map_err(|payload| {
-                    payload
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string())
                 });
-                let _ = ctl_tx.send((w, result)); // caller may be gone already
-            });
-        }
-        drop(ctl_tx);
-
-        let bail = |e: String| -> String {
-            cancel.store(true, Ordering::Relaxed);
-            e
-        };
-        // Reports that arrived before their shard's turn — a later worker
-        // can finish (or die) while an earlier shard is still draining.
-        let mut pending: Vec<(usize, Result<(), String>)> = Vec::new();
-        let mut expected = frames.start;
-        for (w, rx) in receivers.iter().enumerate() {
-            while let Ok(frame) = rx.recv() {
-                if frame.index != expected {
-                    return Err(bail(format!(
-                        "internal: shard {w} delivered frame {} while expecting {expected}",
-                        frame.index
-                    )));
-                }
-                expected += 1;
-                if let Err(e) = consume(frame) {
-                    return Err(bail(e));
-                }
-                consumed += 1;
-                while let Ok(report) = ctl_rx.try_recv() {
-                    match report {
-                        (who, Err(e)) => {
-                            return Err(bail(format!("render worker {who} failed: {e}")));
-                        }
-                        ok => pending.push(ok),
+            }
+            drop(result_tx);
+            drop(job_rx);
+            let mut jobs = frames.clone();
+            for index in jobs.by_ref().take(limit) {
+                job_tx
+                    .send(index)
+                    .map_err(|_| "render workers disconnected")?;
+            }
+            let mut pending = BTreeMap::new();
+            let mut expected = frames.start;
+            let mut consumed = 0;
+            while expected < frames.end {
+                let (index, result) = result_rx
+                    .recv()
+                    .map_err(|_| "render workers exited without a result")?;
+                pending.insert(index, result);
+                while let Some(result) = pending.remove(&expected) {
+                    consume(result?)?;
+                    consumed += 1;
+                    expected += 1;
+                    if let Some(index) = jobs.next() {
+                        job_tx
+                            .send(index)
+                            .map_err(|_| "render workers disconnected")?;
                     }
                 }
             }
-            // The shard's channel closed ⇒ its worker exited ⇒ its
-            // report is enqueued or in flight — collect until it arrives.
-            // A *different* worker's failure found on the way still wins.
-            let report = loop {
-                if let Some(i) = pending.iter().position(|(who, _)| *who == w) {
-                    break pending.remove(i).1;
-                }
-                match ctl_rx.recv() {
-                    Ok((who, Err(e))) => {
-                        return Err(bail(format!("render worker {who} failed: {e}")));
-                    }
-                    Ok(report) if report.0 == w => break report.1,
-                    Ok(report) => pending.push(report),
-                    Err(_) => {
-                        return Err(bail(format!("render worker {w} exited without a report")));
-                    }
-                }
-            };
-            report.map_err(|e| bail(format!("render worker {w} failed: {e}")))?;
-        }
-        Ok(())
-    })?;
-    Ok(consumed)
+            Ok(consumed)
+        })();
+        cancel.store(true, Ordering::Relaxed);
+        result
+    })
 }
 
 /// Collect-everything wrapper over [`render_frames_into`] — holds every
@@ -841,5 +785,57 @@ mod tests {
         let err = render_frames_into(&scene, &timings, 0..30, 4, &exploding, |_| Ok(()))
             .expect_err("warm-up panic should surface as Err");
         assert!(err.contains("program exploded"), "panic preserved: {err}");
+    }
+    #[test]
+    fn shared_queue_sustains_workers_and_bounds_outstanding_frames() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Barrier, Mutex};
+        struct Tracked {
+            worker: usize,
+            barrier: Arc<Barrier>,
+            jobs: Arc<Mutex<Vec<(u64, usize)>>>,
+        }
+        impl FrameSource for Tracked {
+            fn sample(&mut self, src: &str, frame: u64, fps: f64) -> Option<Frame> {
+                self.jobs.lock().unwrap().push((frame, self.worker));
+                self.barrier.wait();
+                StubFrames.sample(src, frame, fps)
+            }
+        }
+        let scene = test_scene();
+        let timings = TimingMap::default();
+        let barrier = Arc::new(Barrier::new(4));
+        let jobs = Arc::new(Mutex::new(Vec::new()));
+        let worker_id = AtomicUsize::new(0);
+        let worker_jobs = jobs.clone();
+        let factory = move |scene, timings| {
+            let mut r = renderer(scene, timings);
+            r.clips = Box::new(Tracked {
+                worker: worker_id.fetch_add(1, Ordering::Relaxed),
+                barrier: barrier.clone(),
+                jobs: worker_jobs.clone(),
+            });
+            r
+        };
+        let mut delivered = 0;
+        render_frames_into(&scene, &timings, 0..64, 4, &factory, |_| {
+            assert!(jobs.lock().unwrap().len() <= delivered + 16);
+            delivered += 1;
+            Ok(())
+        })
+        .unwrap();
+        let jobs = jobs.lock().unwrap();
+        for quarter in 0..4 {
+            let workers: std::collections::BTreeSet<_> = jobs
+                .iter()
+                .filter(|(frame, _)| (quarter * 16..quarter * 16 + 16).contains(frame))
+                .map(|(_, worker)| worker)
+                .collect();
+            assert_eq!(
+                workers.len(),
+                4,
+                "all workers remain active in every quarter"
+            );
+        }
     }
 }
