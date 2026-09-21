@@ -30,6 +30,7 @@ Windows-x86_64 (`.github/workflows/release.yml`).
 engine init myvideo               # scaffold scene.toml + main.scene + assets/
 engine check myvideo/main.scene   # validate; every error has a source span
 engine adapt clip.mp4 --out draft.scene   # draft a scene from footage
+engine meme clip.mp4 --out meme-out       # flash-cut analysis → keeps + meme.scene
 engine align main.scene --markers m.txt --out timings.json
 engine render main.scene --timings timings.json
 engine ui --dir myvideo           # localhost test UI (edit → check → render → watch)
@@ -79,9 +80,10 @@ crates/
   scene-cap      capability registry: credentials + subprocess/HTTP connectors
   scene-script   QuickJS sandbox → JSON DrawList (no fs/process, capped)
   scene-adapt    ingest → probe → shot-detect → draft .scene
-  engine         CLI binary: init check parse align adapt render cap doctor
-connectors/      reference capability connectors (TTS, image)
-docs/playbooks/  worked examples
+  scene-meme     flash-cut pipeline: perceive → peaks → route → analyze → emit
+  engine         CLI binary: init check parse align adapt meme render cap doctor
+connectors/      reference capability connectors (TTS, image, jev, gemini, embed)
+docs/playbooks/  worked examples; ../flash-cut-pipeline.md — the meme spec
 ```
 
 Error style is rustc-like: every diagnostic carries a byte span into the

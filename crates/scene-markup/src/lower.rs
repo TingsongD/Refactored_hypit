@@ -300,9 +300,11 @@ impl Lower {
     fn element(&mut self, node: &RawNode) -> Option<Element> {
         let kind = match node.name.as_str() {
             "clip" => {
-                self.check_attrs(node, &with_common(&["src"]));
+                self.check_attrs(node, &with_common(&["src", "from"]));
+                let from_s = self.parse_attr(node, "from", parse_secs).unwrap_or(0.0);
                 self.src_attr(node).map(|a| ElementKind::Clip {
                     src: a.value.clone(),
+                    from_s,
                 })
             }
             "image" => {
@@ -366,13 +368,19 @@ impl Lower {
                 }
             }
             "music" | "sound" => {
-                self.check_attrs(node, &with_common(&["src", "gain", "duck"]));
+                self.check_attrs(node, &with_common(&["src", "gain", "duck", "from"]));
                 let src = self.src_attr(node).map(|a| a.value.clone());
                 let gain_db = self.parse_attr(node, "gain", parse_gain_db).unwrap_or(0.0);
                 let duck = node.attr("duck").map(|a| a.value.clone());
+                let from_s = self.parse_attr(node, "from", parse_secs).unwrap_or(0.0);
                 src.map(|src| {
                     if node.name == "music" {
-                        ElementKind::Music { src, gain_db, duck }
+                        ElementKind::Music {
+                            src,
+                            gain_db,
+                            duck,
+                            from_s,
+                        }
                     } else {
                         if duck.is_some() {
                             self.warning(
@@ -380,7 +388,11 @@ impl Lower {
                                 "`duck` has no effect on <sound> (use <music>)",
                             );
                         }
-                        ElementKind::Sound { src, gain_db }
+                        ElementKind::Sound {
+                            src,
+                            gain_db,
+                            from_s,
+                        }
                     }
                 })
             }
@@ -714,6 +726,43 @@ mod tests {
             "{:?}",
             errors(&diags)
         );
+    }
+
+    #[test]
+    fn from_sets_source_offsets() {
+        let src = SCENE
+            .replace(r#"<clip src="a.mp4""#, r#"<clip src="a.mp4" from="12.37s""#)
+            .replace(
+                r#"<music src="bed.mp3""#,
+                r#"<music src="bed.mp3" from="250ms""#,
+            );
+        let (scene, diags) = lower_str(&src);
+        assert!(errors(&diags).is_empty(), "errors: {:?}", errors(&diags));
+        let scene = scene.unwrap();
+        match &scene.tracks[1].elements[0].kind {
+            ElementKind::Clip { from_s, .. } => assert_eq!(*from_s, 12.37),
+            other => panic!("expected clip, got {other:?}"),
+        }
+        match &scene.tracks[2].elements[0].kind {
+            ElementKind::Music { from_s, .. } => assert_eq!(*from_s, 0.25),
+            other => panic!("expected music, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_rejects_bad_values() {
+        for bad in ["12f", "abc", "-1s", "soon", "1.5"] {
+            let src = SCENE.replace(
+                r#"<clip src="a.mp4""#,
+                &format!(r#"<clip src="a.mp4" from="{bad}""#),
+            );
+            let (_, diags) = lower_str(&src);
+            assert!(
+                errors(&diags).iter().any(|m| m.contains("invalid time")),
+                "from=`{bad}`: {:?}",
+                errors(&diags)
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@ scene-audio.workspace = true
 scene-align.workspace = true
 scene-cap.workspace = true
 scene-adapt.workspace = true
+scene-meme.workspace = true
 scene-script.workspace = true
 clap.workspace = true
 miette.workspace = true

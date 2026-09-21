@@ -67,13 +67,15 @@ board's span.
 
 ## Elements
 
-- `clip src` — video footage, canvas-cover (`at` = crop focal)
+- `clip src` — video footage, canvas-cover (`at` = crop focal);
+  `from="12.37s"` starts sampling the source at that offset
 - `image src` — still, canvas-cover
 - `text` — literal body text or `bind="line.field"` into the script
 - `board` — styled group; children stack vertically inside it
 - `captions anchor="track.words"` — word-highlighted subtitles
-- `music` / `sound` — 48 kHz audio; `gain="-6dB"` (finite), `duck="voice"`
-  — `duck` works on `music` only; on `sound` it's ignored with a warning
+- `music` / `sound` — 48 kHz audio; `gain="-6dB"` (finite), `duck="voice"`,
+  `from="Ns"` source offset — `duck` works on `music` only; on `sound`
+  it's ignored with a warning
 - `program src with` — sandboxed JS draw program (below)
 
 Common attributes: `during`, `at` (`center|top|bottom|left|right` or
@@ -124,6 +126,24 @@ the source has audio. It always parses clean — it's a starting point
 you edit, not a finished edit. With `--out`, footage outside the draft's
 project root is copied into its `assets/` first, so the emitted `src`
 always resolves inside the scene (a downloaded URL moves, not copies).
+
+## Meme (flash-cut analysis → draft scene)
+
+```bash
+engine meme clip.mp4 --out meme-out [--brief b.toml] [--timings t.json]
+```
+
+Local perception only — nothing uploads: per-frame visual metrics +
+audio onsets fuse into beat candidates, snap to word boundaries when
+`--timings` is present, and emit `meme.scene` where each keep is a
+`<clip from="t">` + `<sound from="t">` pair (audio cuts with picture).
+Optional `scene.toml` capabilities add a Jev text route (fact sheets —
+never pixels/vectors) and a Gemini pass over kept stills/short windows;
+absent → fully offline dHash mode. Decisions are typed:
+`export | need_more_peaks | rerun_window` (the last re-analyzes one keep
+only). `--materialize` writes physical `out/beats/*.mp4` instead of
+`from` offsets. Stage caches under `out/.cache/` key on content hashes —
+a rerun replays only what changed. Spec: `docs/flash-cut-pipeline.md`.
 
 ## Capabilities (external asset generation)
 

@@ -1,0 +1,22 @@
+[package]
+name = "scene-meme"
+description = "Flash-cut meme analysis: perceive, pick peaks, route, emit a .scene draft"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+scene-cap.workspace = true
+scene-media.workspace = true
+scene-time.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+rustfft.workspace = true
+
+[dev-dependencies]
+scene-ir.workspace = true
+scene-markup.workspace = true

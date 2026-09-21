@@ -29,7 +29,7 @@ impl Scene {
         fn walk<'a>(elements: &'a [Element], refs: &mut Vec<(&'a str, Span)>) {
             for element in elements {
                 match &element.kind {
-                    ElementKind::Clip { src }
+                    ElementKind::Clip { src, .. }
                     | ElementKind::Image { src }
                     | ElementKind::Music { src, .. }
                     | ElementKind::Sound { src, .. }
@@ -267,9 +267,13 @@ pub struct Element {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ElementKind {
-    /// Frame-sampled video footage.
+    /// Frame-sampled video footage. `from_s` is a source-time offset —
+    /// the clip plays `src[from .. from + during]` rather than starting
+    /// at the source's first frame.
     Clip {
         src: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        from_s: f64,
     },
     Image {
         src: String,
@@ -287,10 +291,15 @@ pub enum ElementKind {
         src: String,
         gain_db: f64,
         duck: Option<String>,
+        /// Source-time offset — plays `src[from .. from + during]`.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        from_s: f64,
     },
     Sound {
         src: String,
         gain_db: f64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        from_s: f64,
     },
     /// A sandboxed authored program — JS that emits a DrawList per
     /// frame. `with` is an optional JSON payload passed to `setup`/`render`.
@@ -384,6 +393,37 @@ pub struct RenderTarget {
     pub span: Span,
 }
 
+/// Serde `skip_serializing_if` helper: `from_s: 0.0` is the default and
+/// stays out of the printed IR.
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// `from="12.37s"` or `from="250ms"` — a source-time offset. Seconds
+/// and milliseconds only: frame counts (`Nf`) are rejected because the
+/// source's own frame rate isn't known at parse time.
+pub fn parse_secs(s: &str) -> Result<f64, String> {
+    let digits = s
+        .strip_suffix("ms")
+        .map(|d| (d, 1000.0))
+        .or_else(|| s.strip_suffix('s').map(|d| (d, 1.0)));
+    let Some((digits, per_sec)) = digits else {
+        return Err(format!("invalid time `{s}` (use `12.37s` or `250ms`)"));
+    };
+    let v: f64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid time `{s}`"))?;
+    let secs = v / per_sec;
+    // Same guard as parse_gain_db — `nan`/`inf` must not reach seeks
+    // or the audio graph, and a negative offset would play before the
+    // source starts.
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(format!("invalid time `{s}` (need a finite value >= 0)"));
+    }
+    Ok(secs)
+}
+
 /// `gain="-14dB"` or `gain="-14"`.
 pub fn parse_gain_db(s: &str) -> Result<f64, String> {
     let digits = s.strip_suffix("dB").unwrap_or(s);
@@ -467,6 +507,23 @@ mod tests {
             Placement::Point { x: 540.0, y: 960.0 }
         );
         assert!(Placement::parse("middle").is_err());
+    }
+
+    #[test]
+    fn secs_parse() {
+        assert_eq!(parse_secs("12.37s").unwrap(), 12.37);
+        assert_eq!(parse_secs("250ms").unwrap(), 0.25);
+        assert_eq!(parse_secs("0s").unwrap(), 0.0);
+        // Frame counts are refused — the source's fps isn't known here.
+        assert!(parse_secs("12f").is_err());
+        assert!(parse_secs("abc").is_err());
+        assert!(parse_secs("soon").is_err());
+        // Bare numbers are ambiguous (seconds? frames?); require a unit.
+        assert!(parse_secs("1.5").is_err());
+        assert!(parse_secs("-1s").is_err());
+        // Same trap as gains — nan/inf must not reach a seek.
+        assert!(parse_secs("nans").is_err());
+        assert!(parse_secs("1e999s").is_err());
     }
 
     #[test]

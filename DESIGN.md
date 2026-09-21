@@ -59,6 +59,7 @@ before the previous gate is green.
 | M10 | adapt | `scene-adapt`: ingest (path / yt-dlp URL) → probe → shot-detect (96×54@4fps decode, mean-abs-diff, median+6·MAD robust threshold, min-shot merge) → `emit_scene` draft markup; `engine adapt` | ✅ done — 10 tests: diff/cut math + emitted markup lowers clean through our own parser; gated test found real cuts @2s/4s in a 3-shot lavfi clip; e2e adapt→check→render h264+aac verified |
 | M11 | ship | `SKILL.md` authoring reference (original); `docs/playbooks/` (word-timed captions, program overlay, adapt); `release.yml` tag→3-OS binaries; README refresh | ✅ done — release build smoke: `doctor`/`init`/`check`/`align`/`render` all work on the installed binary; `<program>` ops verified in release output pixels |
 | M12 | ui | `engine ui` — localhost test UI. Hand-rolled HTTP/1.1 (zero new deps): editor + `check`/`render` JSON APIs + `/out/` range-served mp4. `render_inner` shared with CLI | ✅ done — 11 ui tests (range parsing incl. inverted-range no-panic, traversal 403, JSON content-type gate, validate-before-save); live verified: check diags, render→mp4, 206 seeking |
+| M13 | meme | `scene-meme` + `engine meme` — flash-cut pipeline per `docs/flash-cut-pipeline.md`: `PcmStream` audio decode, fused visual+audio peaks, fact-sheet Jev routing, Gemini on kept frames only, content-hash stage caches, `from`-offset `.scene` emit; all capabilities optional (offline dHash mode complete) | ✅ done — 50 unit + 6 gated tests; e2e: synthetic 4-cut clip → fused `cut_on_beat` keeps → valid `.scene` → rendered mp4; rerun hits caches |
 
 Gates that need ffmpeg mark the test `#[ignore]` unless `SCENE_MEDIA_TESTS=1`
 is set — CI runs them on the legs that install ffmpeg.
@@ -123,6 +124,18 @@ Facts a change must preserve — each is pinned by a test:
   clobbering an unrelated file — numeric suffixes), and downloads
   relocate outright; the emitted `src` always resolves inside the root
   it will be rendered under.
+- **`from` is a source offset, never program time.** `clip`/`music`/
+  `sound` sample the file starting at `from_s` — raster shifts the
+  element-local frame by `from_s×fps`, the audio graph carries
+  `src_start_s`. Seconds literals only; a frame count can't parse
+  because source fps is unknown at parse time.
+- **The meme pipeline's data boundary is structural.** Code and
+  embeddings see pixels; Jev receives only readable fact rows (tests
+  grep the request for vector/base64 keys); Gemini receives only
+  materialized keep files — never the source at native fps. Every stage
+  cache key names all its inputs, so a changed video/encoder/brief can't
+  silently reuse a downstream artifact; absent capabilities degrade to
+  warnings, not errors — offline runs still emit scene + keeps.
 - **Asset and program failures report through `WarnSink`.** Media
   sources and `SandboxPrograms` share one `BTreeSet` sink — dedup for
   free, surfaced in the render diagnostics bundle and the UI.

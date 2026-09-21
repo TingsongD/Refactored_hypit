@@ -167,14 +167,16 @@ impl<'a> Renderer<'a> {
     /// Element content drawn at `rect` in dst space.
     fn draw_content(&mut self, dst: &mut Pixmap, placed: &PlacedElement, rect: Rect) {
         match &placed.element.kind {
-            ElementKind::Clip { src } => {
+            ElementKind::Clip { src, from_s } => {
+                let fps = self.scene.frame_rate.to_f64();
+                // `from` shifts the element-local frame into source time:
+                // local 0 samples source frame `from_s * source_fps` —
+                // the +from_s*program_fps here lands there through the
+                // frame source's rate mapping.
+                let offset = (from_s * fps).round().max(0.0) as u64;
                 let frame = self
                     .clips
-                    .sample(
-                        src,
-                        u64::from(placed.local_frame),
-                        self.scene.frame_rate.to_f64(),
-                    )
+                    .sample(src, u64::from(placed.local_frame) + offset, fps)
                     .unwrap_or_else(|| placeholder_frame(rect.w as u32, rect.h as u32));
                 self.draw_cover(dst, &frame, rect, placed.focal);
             }

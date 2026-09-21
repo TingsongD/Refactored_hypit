@@ -483,6 +483,7 @@ mod tests {
         let s = scene(vec![element(
             ElementKind::Clip {
                 src: "a.mp4".into(),
+                from_s: 0.0,
             },
             Some(Placement::Named(NamedPlacement::Top)),
             None,
@@ -628,6 +629,7 @@ mod tests {
                     src: "bed.mp3".into(),
                     gain_db: -14.0,
                     duck: None,
+                    from_s: 0.0,
                 },
                 None,
                 None,
@@ -651,6 +653,7 @@ mod tests {
             element(
                 ElementKind::Clip {
                     src: "a.mp4".into(),
+                    from_s: 0.0,
                 },
                 None,
                 None,
@@ -764,6 +767,7 @@ mod tests {
         let s = scene(vec![element(
             ElementKind::Clip {
                 src: "a.mp4".into(),
+                from_s: 0.0,
             },
             None,
             None,
@@ -789,6 +793,7 @@ mod tests {
             element(
                 ElementKind::Clip {
                     src: "a.mp4".into(),
+                    from_s: 0.0,
                 },
                 None,
                 None,

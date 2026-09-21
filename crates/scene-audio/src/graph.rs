@@ -159,9 +159,18 @@ fn collect(
     diags: &mut Vec<Diagnostic>,
 ) {
     for el in elements {
-        let (src, gain_db, duck) = match &el.kind {
-            ElementKind::Music { src, gain_db, duck } => (src.as_str(), *gain_db, duck.as_deref()),
-            ElementKind::Sound { src, gain_db } => (src.as_str(), *gain_db, None),
+        let (src, gain_db, duck, from_s) = match &el.kind {
+            ElementKind::Music {
+                src,
+                gain_db,
+                duck,
+                from_s,
+            } => (src.as_str(), *gain_db, duck.as_deref(), *from_s),
+            ElementKind::Sound {
+                src,
+                gain_db,
+                from_s,
+            } => (src.as_str(), *gain_db, None, *from_s),
             _ => {
                 collect(&el.children, track_id, root, clips, ducks, diags);
                 continue;
@@ -183,7 +192,7 @@ fn collect(
         clips.push(AudioClip {
             src,
             target: el.timing.samples,
-            src_start_s: 0.0,
+            src_start_s: from_s,
             gain_db,
             fade: Fade::default(),
             track_id: track_id.to_string(),

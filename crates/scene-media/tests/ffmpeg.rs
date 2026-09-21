@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use scene_ir::Rational;
-use scene_media::{Encoder, FrameStream, probe};
+use scene_media::{Encoder, FrameStream, PcmStream, probe};
 
 fn gated() -> bool {
     std::env::var("SCENE_MEDIA_TESTS").ok().as_deref() == Some("1")
@@ -181,6 +181,86 @@ fn encode_to_unwritable_path_is_failed_not_hung() {
         err.to_string().contains("ffmpeg"),
         "expected tool error, got {err}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PCM sine WAV — exact sample counts (no codec priming/padding, so
+/// hop boundaries are deterministic).
+fn make_wav(dir: &std::path::Path, name: &str, duration_s: &str) -> PathBuf {
+    let path = dir.join(name);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("sine=frequency=440:sample_rate=15360:duration={duration_s}"),
+        ])
+        .arg(&path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success());
+    path
+}
+
+#[test]
+fn pcm_decodes_exact_wav() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tempdir("pcm-exact");
+    let wav = make_wav(&dir, "tone.wav", "0.5");
+    let info = probe(&wav).unwrap();
+    // 0.5s at 15360 Hz = 7680 samples = 15 hops of 512.
+    let stream = PcmStream::open(&wav, &info, 15360, 512).unwrap().unwrap();
+    let chunks: Vec<_> = stream.collect::<Result<_, _>>().unwrap();
+    assert_eq!(chunks.len(), 15, "0.5s must yield exactly 15 hops");
+    for (i, c) in chunks.iter().enumerate() {
+        assert_eq!(c.index, i as u64);
+        assert_eq!(c.samples.len(), 512);
+    }
+    // ffmpeg's `sine` defaults to amplitude 1/8 — RMS ≈ 0.088. Loose
+    // bound: prove the hop carries energy, not silence.
+    let rms: f32 = (chunks[0].samples.iter().map(|s| s * s).sum::<f32>() / 512.0).sqrt();
+    assert!(rms > 0.05, "sine hop should carry energy, rms={rms}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pcm_tail_pads_to_hop() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tempdir("pcm-tail");
+    // 0.503s ≈ 7726±1 samples — 15 full hops plus a ~46-sample tail.
+    let wav = make_wav(&dir, "tail.wav", "0.503");
+    let info = probe(&wav).unwrap();
+    let stream = PcmStream::open(&wav, &info, 15360, 512).unwrap().unwrap();
+    let chunks: Vec<_> = stream.collect::<Result<_, _>>().unwrap();
+    assert_eq!(chunks.len(), 16, "partial tail must surface as a hop");
+    // The tail is zero-padded past its real samples — the pad keeps the
+    // hop grid aligned with the video frames it indexes.
+    assert!(
+        chunks[15].samples[100..].iter().all(|&s| s == 0.0),
+        "tail beyond ~46 real samples must be zero-padded"
+    );
+    assert!(chunks[15].samples[..32].iter().any(|&s| s != 0.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pcm_no_audio_is_none() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tempdir("pcm-none");
+    let clip = make_clip(&dir); // testsrc — video only
+    let info = probe(&clip).unwrap();
+    assert!(info.audio.is_none());
+    let stream = PcmStream::open(&clip, &info, 15360, 512).unwrap();
+    assert!(stream.is_none(), "no audio stream → Ok(None), not an error");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

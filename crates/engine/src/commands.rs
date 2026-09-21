@@ -766,6 +766,107 @@ fn load_registry(config: &Path) -> Result<scene_cap::Registry, String> {
     scene_cap::Registry::from_toml(&text)
 }
 
+/// `engine meme <input>` — the flash-cut pipeline, end to end. Writes
+/// the spec'd artifacts to `out/` and prints a per-stage report.
+#[allow(clippy::too_many_arguments)]
+pub fn meme(
+    input: &Path,
+    brief_path: Option<&Path>,
+    out: &Path,
+    timings_path: Option<&Path>,
+    config: &Path,
+    materialize: bool,
+    beat_sec: f64,
+    gemini_mode: &str,
+    rerun_window: Option<&str>,
+    music: Option<&str>,
+) -> i32 {
+    let brief = match brief_path {
+        Some(p) => match scene_meme::Brief::load(p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("meme: {e}");
+                return 1;
+            }
+        },
+        None => scene_meme::Brief::default(),
+    };
+    let timings = match timings_path {
+        Some(p) => match fs::read_to_string(p)
+            .map_err(|e| e.to_string())
+            .and_then(|j| serde_json::from_str::<TimingMap>(&j).map_err(|e| e.to_string()))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("meme: cannot load timings {}: {e}", p.display());
+                return 1;
+            }
+        },
+        None => TimingMap::default(),
+    };
+    // Capabilities are optional — a missing scene.toml is an offline run,
+    // not an error. A present-but-broken one is an error.
+    let registry = match config.exists() {
+        true => match load_registry(config) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("meme: {e}");
+                return 1;
+            }
+        },
+        false => None,
+    };
+    let mode = match gemini_mode {
+        "stills" => scene_meme::gemini::GeminiMode::Stills,
+        "windows" => scene_meme::gemini::GeminiMode::Windows,
+        other => {
+            eprintln!("meme: --gemini-mode {other} (want `stills` or `windows`)");
+            return 1;
+        }
+    };
+    let opts = scene_meme::run::RunOpts {
+        input,
+        brief: &brief,
+        out,
+        timings,
+        registry: registry.as_ref(),
+        beat_sec,
+        materialize,
+        gemini_mode: mode,
+        rerun_window: rerun_window.map(str::to_string),
+        music_src: music.map(str::to_string),
+    };
+    match scene_meme::run::run(&opts) {
+        Ok(report) => {
+            for st in &report.stages {
+                let hit = if st.cache_hit { "cached" } else { "ran" };
+                println!("  {:<12} {:>6}ms  {hit}  {}", st.stage, st.ms, st.note);
+            }
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
+            if !report.low_confidence.is_empty() {
+                eprintln!(
+                    "low-confidence answers: {}",
+                    report.low_confidence.join(", ")
+                );
+            }
+            println!(
+                "{} candidates → {} keeps → {:?}",
+                report.candidates,
+                report.keeps.len(),
+                report.decision.package
+            );
+            println!("scene: {}", report.scene.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("meme: {e}");
+            1
+        }
+    }
+}
+
 /// Each tool's version flag — `yt-dlp`/`uv` take GNU-style `--version`;
 /// the ffmpeg family takes its own `-version`. The wrong flag exits
 /// nonzero, which must read as missing, not "ok".

@@ -93,6 +93,7 @@ mod tests {
                             src: "bed.mp3".into(),
                             gain_db: -14.0,
                             duck: Some("voice".into()),
+                            from_s: 0.0,
                         },
                         timing(0, 10),
                     )],
@@ -103,6 +104,7 @@ mod tests {
                         ElementKind::Sound {
                             src: "vo.wav".into(),
                             gain_db: 0.0,
+                            from_s: 0.0,
                         },
                         timing(2, 8),
                     )],
@@ -129,6 +131,44 @@ mod tests {
     }
 
     #[test]
+    fn from_lands_in_src_start_s() {
+        // `from` on <music>/<sound> is a source-time offset — the clip
+        // plays src[from .. from + during] via src_start_s.
+        let scene = scene(
+            vec![
+                track(
+                    "music",
+                    vec![audio_el(
+                        ElementKind::Music {
+                            src: "bed.mp3".into(),
+                            gain_db: 0.0,
+                            duck: None,
+                            from_s: 2.5,
+                        },
+                        timing(0, 10),
+                    )],
+                ),
+                track(
+                    "voice",
+                    vec![audio_el(
+                        ElementKind::Sound {
+                            src: "vo.wav".into(),
+                            gain_db: 0.0,
+                            from_s: 0.25,
+                        },
+                        timing(2, 8),
+                    )],
+                ),
+            ],
+            10,
+        );
+        let (graph, diags) = AudioGraph::from_scene(&scene, Path::new("/proj"));
+        assert!(diags.is_empty());
+        assert_eq!(graph.clips[0].src_start_s, 2.5);
+        assert_eq!(graph.clips[1].src_start_s, 0.25);
+    }
+
+    #[test]
     fn duck_without_key_warns_and_degrades() {
         let scene = scene(
             vec![track(
@@ -138,6 +178,7 @@ mod tests {
                         src: "bed.mp3".into(),
                         gain_db: 0.0,
                         duck: Some("narration".into()),
+                        from_s: 0.0,
                     },
                     timing(0, 5),
                 )],
@@ -157,6 +198,7 @@ mod tests {
             ElementKind::Sound {
                 src: "hit.wav".into(),
                 gain_db: -3.0,
+                from_s: 0.0,
             },
             timing(1, 2),
         )];
@@ -178,6 +220,7 @@ mod tests {
                         ElementKind::Sound {
                             src: "../outside.wav".into(),
                             gain_db: 0.0,
+                            from_s: 0.0,
                         },
                         timing(0, 4),
                     ),
@@ -185,6 +228,7 @@ mod tests {
                         ElementKind::Sound {
                             src: "inside.wav".into(),
                             gain_db: 0.0,
+                            from_s: 0.0,
                         },
                         timing(0, 4),
                     ),
@@ -206,6 +250,7 @@ mod tests {
                         src: "/etc/passwd".into(),
                         gain_db: 0.0,
                         duck: None,
+                        from_s: 0.0,
                     },
                     timing(0, 4),
                 )],

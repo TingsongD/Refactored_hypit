@@ -151,13 +151,13 @@ against. `voice` is an optional label. `<line>` takes `id` + text only.
 
 | element | purpose | extra attributes |
 |---|---|---|
-| `clip` | video footage, canvas-cover | `src` |
+| `clip` | video footage, canvas-cover | `src`, `from` |
 | `image` | still image, canvas-cover | `src` |
 | `text` | text box — literal body **or** `bind` | `bind="line.text"` |
 | `board` | styled group; children stack vertically inside | — |
 | `captions` | word-timed subtitles | `style` (`karaoke` default, `block`), `anchor="track.words"` |
-| `music` | audio bed | `src`, `gain`, `duck` |
-| `sound` | audio clip | `src`, `gain` |
+| `music` | audio bed | `src`, `gain`, `duck`, `from` |
+| `sound` | audio clip | `src`, `gain`, `from` |
 | `program` | sandboxed JS draw script | `src`, `with` (JSON object) |
 
 Attributes every visual element accepts:
@@ -174,6 +174,10 @@ Audio specifics:
 - `duck="voice"` — sidechain-duck this element under the named track.
   `duck` works on `<music>` only; on `<sound>` it's ignored (with a
   warning).
+- `from="12.37s"` — source-time offset: `clip`/`music`/`sound` start
+  sampling the file at `from`, so a window of a longer source needs no
+  pre-cut. Seconds literal only (`250ms`, `1.5s`); `from` says *where in
+  the source*, `during` still says *when in the program*.
 - `<captions>` with no `anchor` defaults to the script's track at word
   granularity; it's an error only when the scene has no `<script>`.
 
@@ -260,6 +264,38 @@ directory, the footage is imported into the draft's `assets/` first
 (a yt-dlp download moves outright) — the emitted `src` never escapes
 the scene's project root.
 
+## Meme — flash-cut drafts
+
+```bash
+engine meme clip.mp4 --out meme-out        # analyze → keeps + meme.scene
+engine meme clip.mp4 --brief brief.toml --timings timings.json
+```
+
+Analyzes a clip locally (pixels never leave the machine): per-frame
+visual metrics plus an audio track that's a first-class signal —
+spectral-flux onsets are co-equal beat generators, so a sound-effect
+hit with no visual cut is still a beat. The candidates route through an
+optional Jev text pass, then an optional Gemini pass on *just the kept
+frames* (stills by default; `--gemini-mode windows` sends short clips).
+The result is a typed decision (`export` / `need_more_peaks` /
+`rerun_window`) and a `.scene` draft: every keep becomes a
+`<clip from="…">` beat plus a matching `<sound>` slice, so the meme's
+audio cuts with its picture. `engine render` on the draft reproduces
+the montage.
+
+Everything past `peaks` is optional — with no `scene.toml` capabilities
+the run is fully offline (dHash signatures, every survivor kept, code
+decision). To wire the models up, register `jev` / `gemini` / `embed`
+capabilities — `connectors/jev.sh`, `connectors/gemini.sh`,
+`connectors/embed.py` are reference scripts you adapt to your endpoints;
+credentials resolve from env/keychain like any connector. Tuning lives
+in the brief (`--brief`, TOML or YAML): thresholds, gaps, models —
+`docs/flash-cut-pipeline.md` is the spec. Every stage caches by content
+hash under `out/.cache/` — reruns skip what hasn't changed, and
+`--rerun-window f371` re-analyzes one keep only. `--materialize`
+pre-cuts physical beat files under `out/beats/` instead of `from`
+offsets; `--beat-sec` sets beat width; `--music` adds a bed.
+
 ## Capabilities — generated assets
 
 `scene.toml` can register connectors for external services (TTS, image
@@ -315,8 +351,8 @@ black frame.
   10 min, connectors 10 min (curl self-aborts at 5), downloads 15 min,
   and stalled decoder/encoder pipes are killed after a 5/2-minute I/O
   stall. A wedged tool is an error, never a hang.
-- A failed render leaves no partial mp4 — the `-y`-truncated file is
-  removed.
+- A failed render leaves no partial mp4 — the encode happens to a
+  temporary sibling and only replaces the target on success.
 - Same-source overlapping `<clip>`s decode correctly but reopen the file
   on backward seeks — prefer one clip per source per moment.
 
@@ -325,5 +361,6 @@ black frame.
 - `SKILL.md` — the authoring reference agents read
 - `docs/playbooks/` — worked scenes (captions over footage, program
   overlays, adapt workflow)
+- `docs/flash-cut-pipeline.md` — the `meme` pipeline spec
 - `DESIGN.md` — architecture, module gates, hardening invariants
 - `DEV_LOG.md` — change history

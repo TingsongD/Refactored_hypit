@@ -81,6 +81,39 @@ enum Cmd {
         #[arg(long)]
         no_open: bool,
     },
+    /// Analyze a clip for flash-cut beats and emit a draft .scene.
+    /// Pixels stay local; jev/gemini capabilities are optional.
+    Meme {
+        /// The source clip to analyze.
+        input: PathBuf,
+        /// Locked brief (.toml/.yaml) — defaults to the built-in brief.
+        #[arg(long)]
+        brief: Option<PathBuf>,
+        /// Output dir: metrics/peaks/keeps/gemini/package + meme.scene.
+        #[arg(long, default_value = "meme-out")]
+        out: PathBuf,
+        /// Optional --timings JSON (word lattice) for beat snapping.
+        #[arg(long)]
+        timings: Option<PathBuf>,
+        /// scene.toml with jev/gemini/embed capabilities — skipped if absent.
+        #[arg(long, default_value = "scene.toml")]
+        config: PathBuf,
+        /// Physically cut beats to out/beats/ instead of `from` offsets.
+        #[arg(long)]
+        materialize: bool,
+        /// Program seconds per emitted beat.
+        #[arg(long, default_value_t = 0.6)]
+        beat_sec: f64,
+        /// `stills` (default) or `windows` for the Gemini stage.
+        #[arg(long, default_value = "stills")]
+        gemini_mode: String,
+        /// Rerun Gemini on one keep id only (uses per-window cache).
+        #[arg(long)]
+        rerun_window: Option<String>,
+        /// Optional music bed under the montage.
+        #[arg(long)]
+        music: Option<String>,
+    },
     /// Inspect or invoke capabilities declared in a scene.toml.
     Cap {
         /// Path to the project's scene.toml.
@@ -145,6 +178,29 @@ fn main() -> ExitCode {
             out,
         } => commands::adapt(source, out_dir, out.as_deref()),
         Cmd::Ui { dir, port, no_open } => ui::serve(dir, *port, !no_open),
+        Cmd::Meme {
+            input,
+            brief,
+            out,
+            timings,
+            config,
+            materialize,
+            beat_sec,
+            gemini_mode,
+            rerun_window,
+            music,
+        } => commands::meme(
+            input,
+            brief.as_deref(),
+            out,
+            timings.as_deref(),
+            config,
+            *materialize,
+            *beat_sec,
+            gemini_mode,
+            rerun_window.as_deref(),
+            music.as_deref(),
+        ),
         Cmd::Cap { config, action } => match action {
             CapCmd::List => commands::cap_list(config),
             CapCmd::Call { name, params, out } => commands::cap_call(config, name, params, out),

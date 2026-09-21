@@ -358,6 +358,7 @@ mod tests {
                         id: Some("bg".into()),
                         kind: ElementKind::Clip {
                             src: "a.mp4".into(),
+                            from_s: 0.0,
                         },
                         timing: timing(0, 90),
                         placement: None,
@@ -405,6 +406,27 @@ mod tests {
         let seven = render_frames(&scene, &timings, 0..30, 7, &renderer).unwrap();
         assert_eq!(one, four);
         assert_eq!(four, seven);
+    }
+
+    #[test]
+    fn clip_from_offsets_the_source_frame() {
+        // `from="1s"` at 30fps shifts the element-local window by 30
+        // source frames: local frame 0 samples what plain frame 30 shows.
+        // Drop the board first — its anim advances between the compared
+        // frames and would muddy the pixel equality.
+        let mut scene = test_scene();
+        scene.tracks[0]
+            .elements
+            .retain(|e| matches!(e.kind, ElementKind::Clip { .. }));
+        let timings = TimingMap::default();
+        let plain = render_frames(&scene, &timings, 0..31, 1, &renderer).unwrap();
+        match &mut scene.tracks[0].elements[0].kind {
+            ElementKind::Clip { from_s, .. } => *from_s = 1.0,
+            _ => unreachable!(),
+        }
+        let shifted = render_frames(&scene, &timings, 0..1, 1, &renderer).unwrap();
+        assert_eq!(shifted[0].pixels, plain[30].pixels);
+        assert_ne!(shifted[0].pixels, plain[0].pixels);
     }
 
     #[test]

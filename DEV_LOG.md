@@ -335,3 +335,66 @@ refuses).
 Gate: fmt, clippy `-D warnings`, workspace tests, `SCENE_MEDIA_TESTS=1`
 — all green, including two new FFmpeg-gated ducking regressions and the
 process-group kill tests.
+
+## 2026-09-21 — Flash-cut pipeline: `engine meme` (M-0…M-J)
+
+The `docs/flash-cut-pipeline.md` handover, implemented end to end as the
+`scene-meme` crate plus one new CLI verb. Pixels stay local; Jev and
+Gemini are optional `scene.toml` capabilities, so a bare checkout still
+runs the whole funnel in dHash mode.
+
+- **`from` source offsets (M-0).** `<clip>`, `<music>` and `<sound>`
+  accept `from="12.37s"` — element frame 0 samples source time `from`,
+  so emitted beats can window the source without materializing media.
+  Verified pixel-exact: `from="1.0s"` frame 0 equals the plain clip's
+  frame 30; audio slices keep their offset through the graph.
+- **`PcmStream` (M-B).** FFmpeg-decoded mono PCM at the analysis hop
+  rate, mirroring `FrameStream`'s spawn/drain/watchdog shape. `None`
+  when the source has no audio stream — silence is data, not an error.
+- **Perceive + metrics (M-C).** One decode pass fills per-frame luma
+  metrics (sharpness, motion, brightness, contrast, dHash `change`) and
+  per-hop audio metrics (loud_db, spectral flux via rustfft, onset,
+  silence, word). Word snapping reads `--timings` word lattices.
+- **Fused peak pick (M-D).** Four co-equal generators — signature-change
+  spikes, pixel-diff spikes (flat-color cuts move every pixel while the
+  dHash can't see it), audio onsets, and importance maxima — merged
+  within `min_gap`, snapped to onset/word boundaries, deduped against
+  the kept set. The sharpness gate stands down on textureless clips;
+  dedup needs structure AND level match (dHash ⊕ luma), so a red beat
+  and a blue beat are different beats.
+- **Content-hash cache + embed connector (M-E).** Every stage key names
+  all inputs (`metrics:{video,encoder,…}`, `peaks:{video,encoder,brief}`
+  …); writes are temp+rename. `connectors/embed.py` is a `uv` reference
+  script returning frame + vocab embeddings; `encoder = "dhash"` needs
+  nothing external.
+- **Pack + jev_route (M-F).** Fact sheets are readable rows only — the
+  data-boundary tests grep for embedding/base64/dhash keys. Keep-rule in
+  code: `keep ∧ too_similar<0.5 ∧ cut_strength≥3`; confidence under the
+  floor flags `low_confidence` instead of auto-exporting.
+- **Gemini connector (M-G).** Stills mode (one labeled PNG per keep) is
+  default; `--gemini-mode windows` transcodes `gemini_window_sec` clips
+  at `gemini_fps` — Gemini's 1 fps default would step over 2–6-frame
+  cuts. `connectors/gemini.sh` inlines parts; the key rides via a `curl
+  -K` file, never argv.
+- **Typed package (M-H).** `export | need_more_peaks | rerun_window`
+  parses strict; `rerun_window` re-analyzes only the named keep's window
+  (per-window cache keys), bounded at 2 loops. Low-confidence routes
+  force `need_more_peaks`.
+- **Emit (M-I).** Each keep → `<clip from>` + matching `<sound>` slice
+  so audio cuts with picture; `--materialize` re-encodes physical beats
+  to `out/beats/`; optional `<music>` bed. Output writes are atomic.
+- **CLI + e2e (M-J).** `engine meme in.mp4 --brief b.toml --out out/
+  --timings t.json --config scene.toml [--materialize|--beat-sec|
+  --gemini-mode|--rerun-window|--music]` writes metrics/peaks/pack/
+  keeps/gemini/package JSON + `meme.scene` + a per-stage report with
+  cache hits. Gated e2e proves the loop: synthetic 4-cut clip →
+  `f15`/`f30` keeps (the swell-fused beat lands `cut_on_beat`), the
+  emitted scene passes `check`, and `render` produces 1.2s of mp4.
+  Second run hits perceive/peaks caches.
+
+Found while validating on flat-color fixtures: spectral-flux hop 0
+reported the whole spectrum as novelty (false onset at t=0 — now primed,
+not spiked), and flat frames dedup-collapsed (see M-D above).
+
+Gate: fmt, clippy `-D warnings`, workspace tests, `SCENE_MEDIA_TESTS=1`
+workspace run — all green; `scene-meme` is 50 unit + 6 gated tests.

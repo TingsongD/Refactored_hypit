@@ -3,12 +3,14 @@
 //!
 //! - [`probe`] — `ffprobe` JSON → [`MediaInfo`]
 //! - [`FrameStream`] — sequential `ffmpeg` rawvideo decode → RGBA frames
+//! - [`PcmStream`] — sequential `ffmpeg` f32le decode → mono sample chunks
 //! - [`Encoder`] — NV12 program stream → H.264/mp4
 
 mod confine;
 mod decode;
 mod encode;
 mod error;
+mod pcm;
 mod probe;
 mod proc;
 mod stderr;
@@ -18,6 +20,7 @@ pub use confine::{Escapes, confine_under_root};
 pub use decode::{Frame, FrameStream};
 pub use encode::Encoder;
 pub use error::{MediaError, Tool};
+pub use pcm::{PcmChunk, PcmStream};
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, parse_probe_json, probe};
 pub use proc::{ProcOutput, output_timeout, spawn_grouped, wait_timeout};
 pub use watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
