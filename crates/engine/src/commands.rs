@@ -9,7 +9,7 @@ use scene_align::{markers_to_timing, parse_markers, timing_map_for, whisperx_to_
 use scene_audio::{AudioGraph, mix_program};
 use scene_ir::{Diagnostic, IR_FORMAT};
 use scene_markup::compile;
-use scene_media::Encoder;
+use scene_media::{Encoder, StagedOutput};
 use scene_render::{
     CosmicText, RenderMeasure, Renderer, SeqFrameSource, StillFrameSource, render_frames_into,
     rgba_to_nv12,
@@ -276,6 +276,7 @@ pub fn align(
 ///
 /// Diagnostics grouped with the source they point into — one bundle
 /// per file that produced them (scene, markers, etc).
+#[derive(Clone)]
 pub struct DiagBundle {
     pub name: String,
     pub source: String,
@@ -295,58 +296,6 @@ pub struct RenderReport {
 pub struct RenderError {
     pub message: String,
     pub bundles: Vec<DiagBundle>,
-}
-
-/// Removes its file on drop — a program wav left behind by a failed
-/// render (mix error, encode error, even a partial mix) is just litter.
-struct TempWav(PathBuf);
-impl Drop for TempWav {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// A unique sibling path for intermediate output: `name.tag-PID-SEQ.ext`
-/// next to `target`. Same-dir keeps the final `fs::rename` atomic; the
-/// pid+seq pair keeps concurrent in-process renders from colliding, so a
-/// temp path can never name (and `-y`-clobber) a file the user owns.
-fn unique_sibling(target: &Path, tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
-    let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-    target.with_file_name(format!("{stem}.{tag}-{pid}-{seq}.{ext}"))
-}
-
-/// Publish `tmp` as `target`, replacing any previous output. Runs only
-/// after a fully successful render — a failed render leaves the prior
-/// output file untouched. The temp must exist before `target` is
-/// touched; unix `rename` replaces atomically, Windows needs a
-/// remove-then-rename fallback.
-fn publish(tmp: &Path, target: &Path) -> Result<(), String> {
-    if !tmp.exists() {
-        return Err(format!("render output {} is missing", tmp.display()));
-    }
-    match fs::rename(tmp, target) {
-        Ok(()) => Ok(()),
-        Err(first) => {
-            if target.exists() {
-                fs::remove_file(target)
-                    .map_err(|e| format!("cannot replace {}: {e}", target.display()))?;
-                fs::rename(tmp, target).map_err(|e| {
-                    format!("cannot move {} to {}: {e}", tmp.display(), target.display())
-                })
-            } else {
-                Err(format!(
-                    "cannot move {} to {}: {first}",
-                    tmp.display(),
-                    target.display()
-                ))
-            }
-        }
-    }
 }
 
 /// The render pipeline with reporting abstracted: diagnostics and
@@ -486,15 +435,6 @@ pub fn render_inner(
             }
         },
     };
-    if let Some(parent) = target.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        return Err(stage(
-            format!("cannot create {}: {e}", parent.display()),
-            bundles,
-        ));
-    }
-
     // Program audio: collect music/sound → 48kHz mix → muxed into the
     // same ffmpeg process as the video pipe. No audio elements = silent.
     // `--frames` selects a window of the program timeline — the mix must
@@ -509,28 +449,29 @@ pub fn render_inner(
     let fps = resolved.frame_rate.to_f64();
     let sample_of = |frame: u32| (frame as f64 / fps * 48_000.0 + 1e-6).floor().max(0.0) as u64;
     let graph = graph.window(sample_of(range.start), sample_of(range.end));
+    let staged = StagedOutput::new(&target)
+        .map_err(|e| stage(format!("cannot stage output: {e}"), bundles.clone()))?;
     let program_wav = if graph.clips.is_empty() {
         None
     } else {
-        // `.wav` — the mixer's ffmpeg picks its muxer by extension.
-        let wav = unique_sibling(&target, "program").with_extension("wav");
-        let guard = TempWav(wav);
-        if let Err(e) = mix_program(&graph, &guard.0) {
+        let audio_dir = staged.directory().join("audio");
+        fs::create_dir(&audio_dir)
+            .map_err(|e| stage(format!("cannot stage audio: {e}"), bundles.clone()))?;
+        let wav = audio_dir.join("program.wav");
+        if let Err(e) = mix_program(&graph, &wav) {
             return Err(stage(format!("audio mix failed: {e}"), bundles));
         }
-        Some(guard)
+        Some(wav)
     };
 
-    // Render into a unique sibling temp, publish on success — `-y` may
-    // truncate the temp all it wants; the previous good output survives
-    // any failed render.
-    let tmp_target = unique_sibling(&target, "tmp");
+    // Declared after staged: ffmpeg is dropped and reaped before staging is
+    // cleaned, including on errors and on Windows with open file handles.
     let mut encoder = match Encoder::open_muxed_opt(
-        &tmp_target,
+        staged.path(),
         resolved.canvas.width,
         resolved.canvas.height,
         &resolved.frame_rate,
-        program_wav.as_ref().map(|t| t.0.as_path()),
+        program_wav.as_deref(),
     ) {
         Ok(e) => e,
         Err(e) => return Err(stage(e.to_string(), bundles)),
@@ -555,7 +496,6 @@ pub fn render_inner(
         }) {
             Ok(n) => n,
             Err(e) => {
-                let _ = fs::remove_file(&tmp_target);
                 return Err(stage(e, bundles));
             }
         };
@@ -572,12 +512,10 @@ pub fn render_inner(
         });
     }
     if let Err(e) = encoder.finish() {
-        let _ = fs::remove_file(&tmp_target);
         return Err(stage(e.to_string(), bundles));
     }
-    if let Err(e) = publish(&tmp_target, &target) {
-        let _ = fs::remove_file(&tmp_target);
-        return Err(stage(e, bundles));
+    if let Err(e) = staged.publish() {
+        return Err(stage(format!("cannot publish output: {e}"), bundles));
     }
     Ok(RenderReport {
         frames: frames_done,
@@ -1051,6 +989,13 @@ fn import_media(path: &Path, scene_dir: &Path, relocate: bool) -> std::io::Resul
     ))
 }
 
+/// Every explicit output has a root, including a bare filename.
+fn adapt_scene_dir(out: &Path) -> &Path {
+    out.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// `engine adapt <source>` — ingest, analyze, emit a draft .scene.
 pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
     let ingested = match scene_adapt::ingest(source, out_dir) {
@@ -1071,10 +1016,7 @@ pub fn adapt(source: &str, out_dir: &Path, out: Option<&Path>) -> i32 {
     // the footage is imported under that root so the emitted src never
     // escapes it; a stdout draft has no root yet — express the source
     // against the cwd instead.
-    let src = match out
-        .and_then(Path::parent)
-        .filter(|p| !p.as_os_str().is_empty())
-    {
+    let src = match out.map(adapt_scene_dir) {
         Some(scene_dir) => {
             if let Err(e) = std::fs::create_dir_all(scene_dir) {
                 eprintln!("adapt: mkdir {}: {e}", scene_dir.display());
@@ -1182,48 +1124,17 @@ mod tests {
     }
 
     #[test]
-    fn temp_wav_removes_its_file_on_drop() {
-        let path = std::env::temp_dir().join(format!("tempwav-{}", std::process::id()));
-        std::fs::write(&path, b"x").unwrap();
+    fn staging_removes_audio_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let wav;
         {
-            let _guard = TempWav(path.clone());
+            let staged = StagedOutput::new(&root.path().join("final.mp4")).unwrap();
+            let audio = staged.directory().join("audio");
+            fs::create_dir(&audio).unwrap();
+            wav = audio.join("program.wav");
+            fs::write(&wav, b"x").unwrap();
         }
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn unique_sibling_is_unique_and_keeps_extension() {
-        let target = Path::new("out/final.mp4");
-        let a = unique_sibling(target, "tmp");
-        let b = unique_sibling(target, "tmp");
-        assert_ne!(a, b);
-        assert_eq!(a.extension().unwrap(), "mp4");
-        assert_eq!(a.parent().unwrap(), Path::new("out"));
-        assert!(
-            a.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("final.tmp-")
-        );
-    }
-
-    #[test]
-    fn publish_replaces_only_on_success() {
-        let dir = std::env::temp_dir().join(format!("publish-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("final.mp4");
-        let tmp = unique_sibling(&target, "tmp");
-        fs::write(&target, b"old-good").unwrap();
-        fs::write(&tmp, b"new-good").unwrap();
-        publish(&tmp, &target).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"new-good");
-        assert!(!tmp.exists());
-        // A publish failure (missing temp) leaves the old output alone.
-        let gone = dir.join("gone.mp4");
-        assert!(publish(&gone, &target).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"new-good");
-        let _ = fs::remove_dir_all(&dir);
+        assert!(!wav.exists());
     }
 
     #[test]

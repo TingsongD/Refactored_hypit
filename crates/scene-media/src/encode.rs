@@ -15,7 +15,7 @@ use scene_ir::Rational;
 use crate::error::{MediaError, Tool};
 use crate::proc::{spawn_grouped, wait_timeout};
 use crate::stderr::StderrDrain;
-use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
+use crate::watchdog::{Heartbeat, StallWatchdog, heartbeat, watch_io};
 
 /// Two minutes without a successful stdin write is a wedged encoder —
 /// the watchdog kills it so `write_frame` returns EPIPE instead of
@@ -117,11 +117,12 @@ impl Encoder {
                 "encoder stdin already closed".to_string(),
             ));
         };
-        match stdin.write_all(nv12) {
-            Ok(()) => {
-                beat(&self.heartbeat);
-                Ok(())
-            }
+        let result = {
+            let _io = watch_io(&self.heartbeat);
+            stdin.write_all(nv12)
+        };
+        match result {
+            Ok(()) => Ok(()),
             Err(e) => Err(if e.kind() == std::io::ErrorKind::BrokenPipe {
                 // EPIPE means ffmpeg died — report its status, not just
                 // the pipe.
@@ -147,6 +148,7 @@ impl Encoder {
     }
 
     fn child_failed(&mut self) -> MediaError {
+        self.watchdog.disarm();
         let status = self
             .child
             .try_wait()
@@ -246,6 +248,11 @@ fn encode_args(out: &Path, w: u32, h: u32, fps: &Rational, audio: Option<&Path>)
             args.push(s.to_string());
         }
     }
+    // Render historically defaults to MP4 when --out has no extension.
+    // Staging preserves the exact basename, so supply the muxer explicitly.
+    if out.extension().is_none() {
+        args.extend(["-f".to_string(), "mp4".to_string()]);
+    }
     args.push(out.display().to_string());
     args
 }
@@ -319,7 +326,10 @@ mod tests {
         // stdin path on a value constructed by hand.
         let (reader, writer) = std::io::pipe().unwrap();
         drop(writer); // EOF — the drain thread exits, so Drop::join returns
+        #[cfg(unix)]
         let child = Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let child = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
         let heartbeat = heartbeat();
         let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), Duration::from_secs(3600));
         let mut enc = Encoder {

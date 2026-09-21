@@ -107,18 +107,21 @@ Facts a change must preserve — each is pinned by a test:
 - **Every subprocess has a deadline, and deadlines kill the tree.**
   `proc::wait_timeout` / `output_timeout` kill+reap past a limit on all
   wait/output call sites. Managed children spawn in their own process
-  group (`spawn_grouped`), so the kill takes descendants too — a
-  connector's `curl` grandchild can't outlive its parent holding our
-  pipes open. Streaming decode/encode can't use a wait deadline (a
+  group on Unix. Capture calls retain that group or a Windows Job Object
+  through parent exit and both output readers reaching EOF, so inherited
+  pipes remain under the deadline. Connector request stdin comes from an
+  anonymous temporary file, avoiding a blocked writer. Streaming decode/encode can't use a wait deadline (a
   blocked pipe `read`/`write` can't rescue itself), so they arm a
-  `StallWatchdog`: heartbeat per successful I/O, `killpg` on unix /
-  `taskkill /T` on Windows when it goes stale, fixed deadlines on EOF
-  reap and muxer teardown.
-- **Renders publish atomically.** The encoder writes a unique sibling
-  temp (`name.tmp-PID-SEQ.ext`); the final target is replaced by rename
-  only after `finish()` succeeds — `-y` can truncate the temp, never a
-  previous good output. Intermediate WAVs get unique names too, so a
-  failed render deletes only its own litter.
+  `StallWatchdog` only for outstanding reads/writes; idle workers do not
+  time out. A stalled operation triggers `killpg` on Unix / `taskkill /T`
+  on Windows; EOF reap and muxer teardown have fixed deadlines.
+- **Renders and capability assets publish atomically.** Each invocation
+  exclusively creates a staging directory on the destination filesystem
+  (mode 0700 on Unix). Video, audio mixes and connector files stay there
+  until completion. A validated nonempty regular output replaces the
+  destination with one rename; a failed rename never deletes the old asset.
+  Staging cleanup runs after child teardown. This is not a power-loss
+  durability guarantee.
 - **`adapt` imports footage into the project.** With `--out`, a source
   outside the scene's root is copied into its `assets/` (never
   clobbering an unrelated file — numeric suffixes), and downloads

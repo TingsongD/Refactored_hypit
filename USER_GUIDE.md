@@ -312,7 +312,12 @@ engine cap list
 engine cap call tts --params '{"text": "Hello.", "voice": "…"}' --out assets/narration.wav
 ```
 
-The connector receives a JSON request on stdin and writes the asset.
+The connector receives a JSON request on stdin and writes the asset to the
+request's `out` path. This is an absolute staging path, retaining the requested
+filename; do not assume it is the final destination. After a successful exit
+and a nonempty regular output, the engine replaces the final asset. Failed
+calls leave any previous asset untouched. Keep subprocess descendants in the
+managed process group/job so timeout cleanup can terminate them.
 Credentials resolve from env or the OS keychain (`auth = { keychain =
 { service = "…", account = "…" } }`) and arrive to the connector as
 `SCENE_CAP_AUTH` — never in argv, never in the scene file. Reference

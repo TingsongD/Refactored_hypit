@@ -12,7 +12,7 @@ use crate::error::{MediaError, Tool};
 use crate::probe::MediaInfo;
 use crate::proc::{spawn_grouped, wait_timeout};
 use crate::stderr::StderrDrain;
-use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
+use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat, watch_io};
 
 /// Same reasoning as decode.rs — five silent minutes is a wedged
 /// decoder, not slow media.
@@ -108,7 +108,11 @@ impl PcmStream {
     fn fill(&mut self, buf: &mut [u8]) -> Result<usize, MediaError> {
         let mut read = 0;
         while read < buf.len() {
-            match self.stdout.read(&mut buf[read..]) {
+            let result = {
+                let _io = watch_io(&self.heartbeat);
+                self.stdout.read(&mut buf[read..])
+            };
+            match result {
                 Ok(0) => break,
                 Ok(n) => {
                     read += n;

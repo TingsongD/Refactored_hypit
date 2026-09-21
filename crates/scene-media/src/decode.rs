@@ -11,7 +11,7 @@ use crate::error::{MediaError, Tool};
 use crate::probe::{MediaInfo, probe};
 use crate::proc::{spawn_grouped, wait_timeout};
 use crate::stderr::StderrDrain;
-use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat};
+use crate::watchdog::{Heartbeat, StallWatchdog, beat, heartbeat, watch_io};
 
 /// Decode reads are local-file I/O — five minutes without a byte is a
 /// wedged decoder, not slow media. The watchdog kills the child so the
@@ -165,6 +165,7 @@ impl FrameStream {
     /// Fill `buf` completely; returns bytes actually read. A clean EOF at
     /// 0 bytes means end of stream; a short count is a truncated frame.
     fn fill(&mut self, buf: &mut [u8]) -> Result<usize, MediaError> {
+        let _io = watch_io(&self.heartbeat);
         let mut read = 0;
         while read < buf.len() {
             match self.stdout.read(&mut buf[read..]) {

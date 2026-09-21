@@ -139,3 +139,99 @@ fn meme_offline_run_emits_a_valid_scene() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn adapt_bare_output_imports_external_footage() {
+    if std::env::var("SCENE_MEDIA_TESTS").is_err() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let source = root.path().join("external.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:size=64x64:rate=8:duration=1",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    Command::cargo_bin("engine")
+        .unwrap()
+        .current_dir(&project)
+        .arg("adapt")
+        .arg(&source)
+        .args(["--out", "draft.scene"])
+        .assert()
+        .success();
+    assert!(project.join("assets/external.mp4").is_file());
+    assert!(source.is_file(), "local source must not be moved");
+    let draft = std::fs::read_to_string(project.join("draft.scene")).unwrap();
+    assert!(draft.contains("external.mp4"));
+    assert!(!draft.contains("../"));
+    Command::cargo_bin("engine")
+        .unwrap()
+        .current_dir(&project)
+        .args(["check", "draft.scene"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn render_publishes_on_success_and_preserves_output_on_failure() {
+    if std::env::var("SCENE_MEDIA_TESTS").is_err() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("main.scene"),
+        r##"<scene canvas="64x64" fps="8" clear="#0000ff"><track kind="visual"><board during="0s..1s"/></track></scene>"##,
+    )
+    .unwrap();
+    for name in ["final.mp4", "final"] {
+        std::fs::write(root.path().join(name), "OLD ASSET").unwrap();
+        Command::cargo_bin("engine")
+            .unwrap()
+            .current_dir(root.path())
+            .args(["render", "main.scene", "--out", name, "--frames", "0:2"])
+            .assert()
+            .success();
+        let info = scene_media::probe(&root.path().join(name)).unwrap();
+        let video = info.video.unwrap();
+        assert_eq!(video.width, 64);
+        assert_eq!(video.height, 64);
+    }
+
+    // An unsupported container fails in the real encoder after staging starts.
+    let bad_target = root.path().join("final.unsupported_container");
+    std::fs::write(&bad_target, "OLD ASSET").unwrap();
+    Command::cargo_bin("engine")
+        .unwrap()
+        .current_dir(root.path())
+        .args([
+            "render",
+            "main.scene",
+            "--out",
+            "final.unsupported_container",
+            "--frames",
+            "0:2",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read_to_string(bad_target).unwrap(), "OLD ASSET");
+    assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".scene-output-")
+    }));
+}

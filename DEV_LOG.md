@@ -398,3 +398,35 @@ not spiked), and flat frames dedup-collapsed (see M-D above).
 
 Gate: fmt, clippy `-D warnings`, workspace tests, `SCENE_MEDIA_TESTS=1`
 workspace run — all green; `scene-meme` is 50 unit + 6 gated tests.
+
+
+
+## Safe output and subprocess follow-up
+
+Plan and rollback: [docs/SAFE_PATCH_PLAN.md](docs/SAFE_PATCH_PLAN.md).
+
+- Replaced predictable render intermediates and delete-then-rename recovery
+  with shared, exclusively created staging directories and a single publish
+  rename. Unix staging starts with mode 0700. Capability calls now use the
+  same path and preserve old assets after spawn failures, failed execution,
+  missing output or empty output. Auxiliary files cannot collide with the
+  asset basename. Extensionless renders still select MP4.
+- Capture deadlines now include output EOF after the parent exits. A Unix
+  process group / Windows Job Object remains available to kill descendants.
+  Connector stdin uses an anonymous file, stderr remains bounded, and unused
+  stdout remains discarded. Deliberately daemonizing connectors are outside
+  the managed group/job contract.
+- Media watchdogs track only outstanding pipe operations. Idle workers and
+  completed operations can wait indefinitely for demand; stalled reads and
+  writes still terminate the child. Disarming wakes the watchdog immediately.
+- Bare `adapt --out draft.scene` imports external footage into the current
+  project's assets directory.
+- Fixed the duck validation Clippy warning and current stable's fixed-size
+  chunk warnings without suppressing lints. Replaced shell-only connector
+  fixtures with portable test executables; lifecycle tests run on all CI OSes.
+
+Local validation (Linux, Rust 1.98.1): strict Clippy, the workspace suite,
+plus the full FFmpeg-enabled suite pass. Regression coverage includes failed
+publication and connector preservation, private staging, parent-first exits,
+unread stdin, idle/active watchdogs, bare-output adaptation, and real encoder
+success/failure. Cross-platform CI is the remaining PR gate.
