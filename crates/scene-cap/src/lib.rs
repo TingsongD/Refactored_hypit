@@ -133,90 +133,131 @@ command = ["cat"]
         assert!(!args2.iter().any(|a| a == "-K"));
     }
 
-    /// A connector test double: captures the request JSON next to the
-    /// out path and writes a marker asset — exercises the whole real
-    /// subprocess path hermetically.
-    fn fake_connector(dir: &std::path::Path) -> PathBuf {
-        let script = dir.join("fake.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\njson=$(cat)\necho \"$json\" > \"$SCENE_CAP_REQLOG\"\nout=$(echo \"$json\" | sed -n 's/.*\"out\" *: *\"\\([^\"]*\\)\".*/\\1/p')\nprintf 'FAKE-ASSET' > \"$out\"\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fn registry(argv: &[String]) -> Registry {
+        // JSON string arrays are also valid TOML, including Windows paths.
+        Registry::from_toml(&format!(
+            "[capabilities.fake]\ncommand = {}\n",
+            serde_json::to_string(argv).unwrap()
+        ))
+        .unwrap()
+    }
+
+    fn fixture_registry() -> Registry {
+        registry(&[
+            std::env::current_exe().unwrap().display().to_string(),
+            "--exact".into(),
+            "tests::connector_fixture".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+        ])
+    }
+
+    /// A real executable fixture on every CI platform. Flooding stderr before
+    /// reading stdin also catches regressions in simultaneous pipe handling.
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn connector_fixture() {
+        use std::io::{Read, Write};
+        std::io::stderr().write_all(&vec![b'x'; 262_144]).unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap();
+        let req: serde_json::Value = serde_json::from_str(&input).unwrap();
+        if let Some(log) = req["params"]["reqlog"].as_str() {
+            std::fs::write(log, &input).unwrap();
         }
-        script
+        let out = req["out"].as_str().unwrap();
+        match req["params"]["mode"].as_str().unwrap_or("success") {
+            "noop" => (),
+            "empty" => std::fs::write(out, "").unwrap(),
+            "fail" => {
+                std::fs::write(out, "PARTIAL").unwrap();
+                eprintln!("nope");
+                std::process::exit(3);
+            }
+            "success" => std::fs::write(out, "FAKE-ASSET").unwrap(),
+            mode => panic!("unknown fixture mode: {mode}"),
+        }
     }
 
     #[test]
     fn subprocess_fulfill_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("scene-cap-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = fake_connector(&dir);
-        let reqlog = dir.join("req.json");
-        let out = dir.join("asset.bin");
-
-        // Registry + request, with the double wired in and a reqlog env
-        // var only this process sees.
-        let toml = format!(
-            "[capabilities.fake]\ncommand = [\"{}\"]\n",
-            script.display()
-        );
-        let reg = Registry::from_toml(&toml).unwrap();
-        unsafe {
-            std::env::set_var("SCENE_CAP_REQLOG", &reqlog);
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let reqlog = dir.path().join("req.json");
+        let out = dir.path().join("asset.bin");
+        std::fs::write(&out, "OLD ASSET").unwrap();
         let got = fulfill(
-            &reg,
+            &fixture_registry(),
             &CapRequest {
                 capability: "fake",
-                params: json!({"text": "hello", "voice": "n"}),
+                params: json!({"text": "hello", "voice": "n", "reqlog": reqlog}),
                 out: &out,
             },
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("SCENE_CAP_REQLOG");
-        }
         assert_eq!(got, out);
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "FAKE-ASSET");
-        // And the connector saw the real request document.
         let req: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&reqlog).unwrap()).unwrap();
         assert_eq!(req["capability"], "fake");
         assert_eq!(req["params"]["text"], "hello");
-        assert_eq!(req["out"], out.display().to_string());
-        let _ = std::fs::remove_dir_all(&dir);
+        let staged = PathBuf::from(req["out"].as_str().unwrap());
+        assert!(staged.is_absolute());
+        assert_ne!(staged, out);
+        assert_eq!(staged.file_name(), out.file_name());
+        assert_eq!(
+            staged.ancestors().nth(3).unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+        assert!(
+            !staged.parent().unwrap().exists(),
+            "staging must be cleaned"
+        );
     }
 
     #[test]
-    fn failing_connector_reports_stderr() {
-        let dir = std::env::temp_dir().join(format!("scene-cap-f-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("fail.sh");
-        std::fs::write(&script, "#!/bin/sh\necho 'nope' >&2\nexit 3\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fn failed_or_missing_connector_output_preserves_existing_asset() {
+        for mode in ["fail", "noop", "empty"] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("asset.bin");
+            std::fs::write(&out, "OLD ASSET").unwrap();
+            let err = fulfill(
+                &fixture_registry(),
+                &CapRequest {
+                    capability: "fake",
+                    params: json!({"mode": mode}),
+                    out: &out,
+                },
+            )
+            .unwrap_err();
+            if mode == "fail" {
+                assert!(matches!(err, CapError::Failed { .. }), "{err}");
+                assert!(err.to_string().contains("nope"), "{err}");
+            } else {
+                assert!(matches!(err, CapError::NoOutput { .. }), "{err}");
+            }
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "OLD ASSET");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
-        let toml = format!("[capabilities.bad]\ncommand = [\"{}\"]\n", script.display());
-        let reg = Registry::from_toml(&toml).unwrap();
+    }
+
+    #[test]
+    fn spawn_failure_preserves_existing_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("asset.bin");
+        std::fs::write(&out, "OLD ASSET").unwrap();
+        let reg = registry(&[dir.path().join("missing-executable").display().to_string()]);
         let err = fulfill(
             &reg,
             &CapRequest {
-                capability: "bad",
+                capability: "fake",
                 params: json!({}),
-                out: &dir.join("x"),
+                out: &out,
             },
         )
         .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("nope"), "{msg}");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(err, CapError::Spawn { .. }), "{err}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "OLD ASSET");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -235,79 +276,25 @@ command = ["cat"]
     }
 
     #[test]
-    fn stale_out_does_not_masquerade_as_output() {
-        let dir = std::env::temp_dir().join(format!("scene-cap-stale-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Connector exits 0 but writes nothing; `out` already holds an
-        // old asset. Success must not be claimed on the stale file.
-        let script = dir.join("noop.sh");
-        std::fs::write(&script, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let out = dir.join("asset.bin");
-        std::fs::write(&out, "OLD ASSET").unwrap();
-        let toml = format!(
-            "[capabilities.noop]\ncommand = [\"{}\"]\n",
-            script.display()
-        );
-        let reg = Registry::from_toml(&toml).unwrap();
-        let err = fulfill(
-            &reg,
-            &CapRequest {
-                capability: "noop",
-                params: json!({}),
-                out: &out,
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(err, CapError::NoOutput { .. }), "{err}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A connector that floods stderr *before* reading the request used
-    /// to deadlock: we wrote all of stdin before draining stderr. The
-    /// channel timeout turns a regression into a test failure instead of
-    /// a hung suite.
-    #[test]
     fn chatty_connector_does_not_deadlock() {
-        let dir = std::env::temp_dir().join(format!("scene-cap-chatty-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("chatty.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\0' 'x' >&2\njson=$(cat)\nout=$(echo \"$json\" | sed -n 's/.*\"out\" *: *\"\\([^\"]*\\)\".*/\\1/p')\nprintf 'OK' > \"$out\"\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let out = dir.join("asset.bin");
-        let toml = format!(
-            "[capabilities.chatty]\ncommand = [\"{}\"]\n",
-            script.display()
-        );
-        let reg = Registry::from_toml(&toml).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("asset.bin");
+        let reg = fixture_registry();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let r = fulfill(
+            let result = fulfill(
                 &reg,
                 &CapRequest {
-                    capability: "chatty",
-                    params: json!({"n": 1}),
+                    capability: "fake",
+                    // Larger than a pipe buffer, while stderr fills first.
+                    params: json!({"text": "x".repeat(262_144)}),
                     out: &out,
                 },
             );
-            let _ = tx.send(r.is_ok());
+            let _ = tx.send(result);
         });
-        let ok = rx
-            .recv_timeout(std::time::Duration::from_secs(15))
-            .expect("fulfill deadlocked — stderr not drained during stdin write");
-        assert!(ok);
-        let _ = std::fs::remove_dir_all(&dir);
+        rx.recv_timeout(std::time::Duration::from_secs(15))
+            .expect("fulfill deadlocked")
+            .unwrap();
     }
 }

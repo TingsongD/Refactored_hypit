@@ -545,13 +545,11 @@ impl Lower {
                     }
                     ElementKind::Music {
                         duck: Some(target), ..
-                    } => {
-                        if !track_ids.contains(target) {
-                            self.error(
-                                element.span,
-                                format!("duck target `{target}` is not a track"),
-                            );
-                        }
+                    } if !track_ids.contains(target) => {
+                        self.error(
+                            element.span,
+                            format!("duck target `{target}` is not a track"),
+                        );
                     }
                     _ => {}
                 }

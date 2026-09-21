@@ -10,6 +10,8 @@ scene-ir.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tempfile = "3"
+command-group = { version = "5.0.1", default-features = false }
 
 # Kill-by-pid for the stall watchdog — the only way a non-owner thread
 # can stop a child blocked mid-pipe. Unix-only; other platforms keep

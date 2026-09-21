@@ -50,6 +50,12 @@ impl StderrDrain {
         String::from_utf8_lossy(&b).trim().to_string()
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(|thread| thread.is_finished())
+    }
+
     /// Join the reader thread — call after the child exits (stderr EOF
     /// ends it) so `tail()` sees the final bytes.
     pub fn join(&mut self) {
