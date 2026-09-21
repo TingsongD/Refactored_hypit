@@ -21,6 +21,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Offline connector tests
+        run: python -m unittest discover -s connectors -p 'test_*.py'
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,8 +57,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # Runner images ship ffmpeg — the version check fails loudly if
-      # that ever changes, instead of letting the env-gated suite skip.
+      # Fail loudly rather than silently skipping the media suite.
       - name: Check FFmpeg
         run: ffmpeg -version && ffprobe -version
 

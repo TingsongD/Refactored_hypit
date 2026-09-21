@@ -34,6 +34,7 @@ only for `adapt` from URLs. Run `engine doctor` to verify.
     <line id="hook">The part nobody mentions.</line>
     <line id="payoff">It compounds either way.</line>
   </script>
+  <track id="voice" kind="audio"/>
   <track kind="visual" anchor="voice">
     <clip src="assets/bg.mp4" during="hook..payoff"/>
     <captions anchor="voice.words" during="hook..payoff"/>
@@ -141,9 +142,11 @@ Optional `scene.toml` capabilities add a Jev text route (fact sheets —
 never pixels/vectors) and a Gemini pass over kept stills/short windows;
 absent → fully offline dHash mode. Decisions are typed:
 `export | need_more_peaks | rerun_window` (the last re-analyzes one keep
-only). `--materialize` writes physical `out/beats/*.mp4` instead of
-`from` offsets. Stage caches under `out/.cache/` key on content hashes —
-a rerun replays only what changed. Spec: `docs/flash-cut-pipeline.md`.
+only). `--materialize` writes physical `out/beats/<content-key>/*.mp4` instead of
+`from` offsets. Stage caches under `out/.cache/v2/` key on content hashes —
+a rerun replays only what changed. Configure `gemini_model` (or `GEMINI_MODEL`)
+when enabling Gemini; explicit brief settings win. Provider adapters are reference
+implementations tested offline. See `connectors/README.md`. Spec: `docs/flash-cut-pipeline.md`.
 
 ## Capabilities (external asset generation)
 

@@ -140,7 +140,7 @@ error.
 </scene>
 ```
 
-Top-level: exactly one `<script>`, any number of `<track>`s, at most one
+Top-level: zero or one `<script>` (required for word anchors), any number of `<track>`s, at most one
 `<render>`.
 
 `<script track="…">` names the audio track that carries the narration —

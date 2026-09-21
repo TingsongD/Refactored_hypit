@@ -392,3 +392,31 @@ JEV_MODEL / GEMINI_MODEL in env — pinned real IDs, not doc placeholders.
 If a future TypeSafe model takes images, still keep perceive + peak
 pick in code. Routing and export stay Jev. Seeing stays a vision model.
 Hearing stays math.
+
+## Consolidated implementation contract
+
+The reference adapters have offline contract coverage, not live vendor acceptance.
+See `connectors/README.md` for model settings, checkpoint loading, transport
+contracts, and cost reporting. Offline dHash analysis remains the default.
+
+Brief fields are strict: unknown fields and duplicate aliases fail.
+`brightness_lo/hi` alias `brightness_min/max`. `onset_keep`, `snap_to_onset`, and
+`snap_to_sharp` independently control onset candidates and snapping. Beat timing
+and representative-frame timing are separate; stills use representative timing.
+Dedup ranks the complete candidate set by importance, sharpness, change, then
+ascending frame index; returned keeps are chronological. Cosine stays on its raw
+−1…1 scale. Nearest-kept scores use the final selection.
+
+Cache entries live under `.cache/v2`; older namespaces are ignored without deletion.
+Keys include canonical stage inputs and upstream identity: source contents,
+analysis grid, timings, vocabulary, effective model/checkpoint, connector command
+and script content, prompt version, mode, and complete keep records where used.
+Credentials are not stage inputs. Invalid embedding dimensions, vocabulary counts,
+nonfinite values, or zero vectors cause a miss. New model settings never reuse a
+prior embedding entry. Source and music imports use content-addressed filenames;
+generated scene references are relative to their scene directory. Materialized
+beats and offset-based beats use the same clamped source windows.
+
+Generated files use private staging and atomic publication. A failed individual
+publication preserves its previous destination. This is per-file atomicity, not a
+transaction spanning every report and media file in a run.

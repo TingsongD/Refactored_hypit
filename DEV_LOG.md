@@ -430,3 +430,40 @@ plus the full FFmpeg-enabled suite pass. Regression coverage includes failed
 publication and connector preservation, private staging, parent-first exits,
 unread stdin, idle/active watchdogs, bare-output adaptation, and real encoder
 success/failure. Cross-platform CI is the remaining PR gate.
+
+## 2026-09-21 — Consolidation and review acceptance
+
+Merged local `3e2ba28` and upstream `dff979c` as `2ff4d2b`, preserving both
+histories and their log/test additions. Recovery branch:
+`recovery/pre-consolidation-3e2ba28`; delivery branch: `fix/consolidate-review`.
+
+Fixed review S1–S6, F1–F8, C1–C4, I1 and D1. The traceability table and limits are
+in `docs/consolidation-review.md`. Highlights: content-addressed staged assets;
+versioned complete cache keys with exact float round trips; validated embeddings;
+quality-ranked dedup, separate representative timing and onset/snapping controls;
+explicit pretrained model/checkpoint selection; strict brief parsing; offline
+provider adapters, preflight callbacks and usage/cost fields; persistent partial
+retry corrections; overflow-safe word offsets; audio for silent-source music.
+
+Completed the deferred shared renderer queue (4×workers outstanding), incremental
+program-state replay, scaled source-time windows and bounded chunked HTTP parsing.
+Follow-up review caught fractional/offset timestamp boundaries and descendant
+stderr teardown; regressions cover both. Streaming process managers retain the
+Unix process group or Windows Job after the parent exits.
+
+Local acceptance: formatting and strict all-target Clippy pass; hermetic workspace
+run passes; latest FFmpeg-enabled workspace run: **332 passed, 0 failed**, with
+four ignored subprocess fixtures invoked by parent tests. Four Python adapter
+contract tests pass. No paid requests or model downloads. Release CLI generated
+and rendered an 18-frame, 160×90 scene with an audio stream; the large-word-offset
+regression also passes under release optimization. Complete README, SKILL,
+USER_GUIDE and word-timed-caption examples pass `engine check` (missing example
+assets remain expected warnings).
+
+CI now installs FFmpeg explicitly on all three operating systems and runs offline
+connector tests plus both Rust suites. Cross-platform publication remains gated
+on the actual branch workflow results, recorded in the delivery report; these
+local checks are not a claim of a live provider or cross-platform pass.
+
+Added a proprietary/all-rights-reserved notice granting no usage rights. Third-party
+terms and repository visibility remain unchanged.

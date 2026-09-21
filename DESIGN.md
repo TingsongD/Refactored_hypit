@@ -50,7 +50,7 @@ before the previous gate is green.
 | M1 | `scene-time` | TimingSource (aligned words), anchor → frame/sample resolution, ResolvedScene, program span, untimed-element inheritance | ✅ done — 21 tests green (58 total) |
 | M2 | `scene-media` | ffprobe JSON → MediaInfo; ffmpeg rawvideo decode → frame iterator | ✅ done — 7 unit + 3 env-gated integration tests green (verified with real ffmpeg 8.0: 10 frames decoded from 1s@10fps lavfi clip) |
 | M3 | `scene-layout` | element tree + resolved timing → positioned boxes per frame; `at` placement; board child stacking | ✅ done — 19 tests green; `Measure` seam takes `(element, local_s)` |
-| M4 | `scene-render` | tiny-skia raster (clip/image/board/text/captions), entrance anims, worker pool, RGBA→NV12 (BT.709) | ✅ done — 12 tests green; byte-identical across 1/4/7 workers *including stateful programs* (shard-prefix ops replay); real cosmic-text ink verified |
+| M4 | `scene-render` | tiny-skia raster (clip/image/board/text/captions), entrance anims, worker pool, RGBA→NV12 (BT.709) | ✅ done — 12 tests green; byte-identical across 1/4/7 workers *including stateful programs* (incremental prefix/gap ops replay); real cosmic-text ink verified |
 | M5 | mux | NV12 pipe → ffmpeg → mp4 (silent); `engine render` end-to-end | ✅ done — 4 unit + 5 gated tests; 30f roundtrip probed 64x36@30/1; `engine render` smoke: 90f → h264/yuv420p/3.0s verified |
 | M6 | `scene-audio` | 48kHz clip graph → ffmpeg filtergraph; real sidechain ducking; `Encoder::open_muxed*` muxes AAC | ✅ done — 7 unit + 2 gated mix tests; ducking verified ≥3dB band-isolated; e2e render = h264+aac/48k stereo |
 | M7 | `scene-align` | markers-file connector (`cue t0 t1`, even word spread); WhisperX JSON parser (order-matched); `engine align` → `--timings` JSON | ✅ done — 7 tests incl. connector→realize integration; e2e align→render verified |
@@ -59,18 +59,19 @@ before the previous gate is green.
 | M10 | adapt | `scene-adapt`: ingest (path / yt-dlp URL) → probe → shot-detect (96×54@4fps decode, mean-abs-diff, median+6·MAD robust threshold, min-shot merge) → `emit_scene` draft markup; `engine adapt` | ✅ done — 10 tests: diff/cut math + emitted markup lowers clean through our own parser; gated test found real cuts @2s/4s in a 3-shot lavfi clip; e2e adapt→check→render h264+aac verified |
 | M11 | ship | `SKILL.md` authoring reference (original); `docs/playbooks/` (word-timed captions, program overlay, adapt); `release.yml` tag→3-OS binaries; README refresh | ✅ done — release build smoke: `doctor`/`init`/`check`/`align`/`render` all work on the installed binary; `<program>` ops verified in release output pixels |
 | M12 | ui | `engine ui` — localhost test UI. Hand-rolled HTTP/1.1 (zero new deps): editor + `check`/`render` JSON APIs + `/out/` range-served mp4. `render_inner` shared with CLI | ✅ done — 11 ui tests (range parsing incl. inverted-range no-panic, traversal 403, JSON content-type gate, validate-before-save); live verified: check diags, render→mp4, 206 seeking |
-| M13 | meme | `scene-meme` + `engine meme` — flash-cut pipeline per `docs/flash-cut-pipeline.md`: `PcmStream` audio decode, fused visual+audio peaks, fact-sheet Jev routing, Gemini on kept frames only, content-hash stage caches, `from`-offset `.scene` emit; all capabilities optional (offline dHash mode complete) | ✅ done — 50 unit + 6 gated tests; e2e: synthetic 4-cut clip → fused `cut_on_beat` keeps → valid `.scene` → rendered mp4; rerun hits caches |
+| M13 | meme | `scene-meme` + `engine meme` — flash-cut pipeline per `docs/flash-cut-pipeline.md`: `PcmStream` audio decode, fused visual+audio peaks, fact-sheet Jev routing, Gemini on kept frames only, content-hash stage caches, `from`-offset `.scene` emit; all capabilities optional (offline dHash mode complete) | Implemented — offline contract regressions and real-media rendering; live providers unverified. See `docs/consolidation-review.md` for acceptance evidence |
 
-Gates that need ffmpeg mark the test `#[ignore]` unless `SCENE_MEDIA_TESTS=1`
-is set — CI runs them on the legs that install ffmpeg.
+Media integration tests return early unless `SCENE_MEDIA_TESTS=1` is set.
+CI explicitly installs FFmpeg on every OS and runs both hermetic and real-media suites.
+Ignored subprocess-fixture tests are launched only by their parent tests.
 
 ## Hardening invariants (post-M12 review passes)
 
 Facts a change must preserve — each is pinned by a test:
 
 - **Worker-count determinism covers state.** Before rasterizing its
-  shard, a worker replays every `ops()` call frames `0..shard.start`
-  would have made (layout only, no pixels). A `render()` that
+  next assigned frame, a worker replays the unprocessed prefix or gap
+  of `ops()` calls that a sequential render would have made (layout only, no pixels). A `render()` that
   accumulates on `d` produces identical output at 1 or N workers — and
   under `--frames` windows, which replay the same prefix from scene
   start rather than from the window's first frame.
@@ -142,16 +143,12 @@ Facts a change must preserve — each is pinned by a test:
 - **Asset and program failures report through `WarnSink`.** Media
   sources and `SandboxPrograms` share one `BTreeSet` sink — dedup for
   free, surfaced in the render diagnostics bundle and the UI.
-- **Frames stream through bounded per-shard channels.** Each worker
-  pushes rendered frames into its own `sync_channel(SHARD_QUEUE)`; the
-  caller drains shards in index order — disjoint contiguous ranges make
-  that ordered concatenation, no reorder buffer — and feeds the encoder
-  through a callback, all inside `thread::scope`. Peak frame memory is
-  `workers×(q+1)+1` frames (~340 MB at 8 workers/1080×1920) regardless
-  of duration, not the whole video. Cancellation is flag + dropped
-  receivers (a blocked `send` never observes a flag); the initiating
-  error always propagates. `render_frames` remains as a collecting
-  wrapper for tests and short clips.
+- **Frames use a bounded shared ascending job queue.** At most `4 × workers`
+  jobs are outstanding across queued, running, and buffered results. An ordered
+  result buffer feeds the consumer; each worker retains its renderer. Cancellation
+  disconnects both channels and joins workers. Panics become ordered errors, so
+  an earlier consumer failure remains the initiating error. `render_frames` is
+  the collecting wrapper for tests and short clips.
 
 ## Timing semantics (locked by M1 tests)
 

@@ -4,9 +4,10 @@ Agent-authored video, timed by words. Write a `.scene` document — script,
 tracks, anchored elements — and the `engine` binary compiles it into an
 mp4. Rewrite a line and the composition re-times itself.
 
-Status: **all 12 modules complete** — markup → IR → timing → layout →
+The workspace contains 13 crates (architecture stages M0–M13): markup → IR → timing → layout →
 raster → audio → mux, plus alignment, capabilities, sandboxed `<program>`
-scripts, `adapt` ingestion, and the localhost test UI. See `DESIGN.md`
+scripts, `adapt` ingestion, the flash-cut pipeline, and the localhost test UI.
+Provider adapters have offline contract tests; live provider behavior is unverified. See `DESIGN.md`
 for architecture and the per-module gates; `USER_GUIDE.md` for the
 end-to-end walkthrough; `SKILL.md` for the authoring reference;
 `docs/playbooks/` for worked examples; `DEV_LOG.md` for the change
@@ -50,6 +51,7 @@ Literal anchors (`during="1.5s..4s"`, `during="0f..90f"`) are the escape hatch.
     <line id="hook">Nobody talks about the third rule.</line>
     <line id="payoff">Compound interest is a treadmill.</line>
   </script>
+  <track id="voice" kind="audio"/>
   <track kind="visual" anchor="voice">
     <captions anchor="voice.words"/>
     <board during="payoff" at="center" anim="rise">
@@ -74,7 +76,7 @@ crates/
   scene-media    ffprobe/ffmpeg subprocesses: probe, decode, encode
   scene-layout   resolved elements → positioned boxes per frame
   scene-render   tiny-skia raster + cosmic-text + deterministic worker pool
-                 (frames stream to the encoder over bounded per-shard queues)
+                 (frames stream to the encoder over a bounded shared job queue and ordered results)
   scene-audio    48 kHz clip graph → ffmpeg filtergraph mix (ducking)
   scene-align    markers-file / WhisperX → TimingMap
   scene-cap      capability registry: credentials + subprocess/HTTP connectors
@@ -98,4 +100,7 @@ cargo test --workspace                 # unit tests, hermetic
 SCENE_MEDIA_TESTS=1 cargo test --workspace   # + real-ffmpeg integration
 ```
 
-CI runs the hermetic set on Ubuntu, Windows and macOS.
+CI installs FFmpeg and runs both suites on Ubuntu, Windows and macOS, plus offline Python connector tests.
+Run those locally with `python3 -m unittest discover -s connectors -p 'test_*.py'`.
+
+This repository is proprietary; see [COPYRIGHT](COPYRIGHT). Third-party components retain their own terms.
