@@ -25,7 +25,6 @@ import os
 import subprocess
 import sys
 
-import numpy as np
 
 
 def fail(msg: str) -> "NoReturn":
@@ -33,27 +32,42 @@ def fail(msg: str) -> "NoReturn":
     sys.exit(1)
 
 
-def decode_frames(video: str, size: int, fps: float) -> np.ndarray:
-    """ffmpeg → RGB bytes on the analysis grid, one row per frame."""
-    cmd = [
-        os.environ.get("FFMPEG", "ffmpeg"),
-        "-v", "error",
-        "-i", video,
-        "-vf", f"scale={size}:{size},fps={fps}",
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        "-",
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        fail(f"ffmpeg decode failed: {e.stderr.decode(errors='replace')[-400:]}")
-    raw = proc.stdout
+def decode_batches(video, size, fps, batch_size=32):
+    """Stream bounded RGB batches; stderr inherits the bounded connector capture."""
+    import numpy as np
+    cmd = [os.environ.get("FFMPEG", "ffmpeg"), "-v", "error", "-i", video,
+           "-vf", f"scale={size}:{size},fps={fps}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     frame_len = size * size * 3
-    n = len(raw) // frame_len
-    if n == 0:
-        fail("ffmpeg produced no frames")
-    return np.frombuffer(raw[: n * frame_len], np.uint8).reshape(n, size, size, 3)
+    try:
+        batch = []
+        while True:
+            raw = proc.stdout.read(frame_len)
+            if not raw:
+                break
+            if len(raw) != frame_len:
+                raise ValueError("truncated RGB frame")
+            batch.append(np.frombuffer(raw, np.uint8).reshape(size, size, 3))
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+        if proc.wait() != 0:
+            raise ValueError("ffmpeg decode failed")
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+def load_model(open_clip, params):
+    model_name = params["model"]
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        model_name, pretrained=params["weights_id"], require_pretrained=True)
+    model.eval()
+    return model, preprocess, open_clip.get_tokenizer(model_name)
 
 
 def main() -> None:
@@ -68,32 +82,21 @@ def main() -> None:
     except ImportError as e:
         fail(f"missing dependency {e.name} — run via `uv run` so the inline deps resolve")
 
-    model_name = os.environ.get("OPEN_CLIP_MODEL", "MobileCLIP2-S0")
-    model, _, preprocess = open_clip.create_model_and_transforms(model_name)
-    tokenizer = open_clip.get_tokenizer(model_name)
-    model.eval()
-
-    frames = decode_frames(params["video"], int(params["size"]), float(params["fps"]))
+    model, preprocess, tokenizer = load_model(open_clip, params)
     vocab = list(params.get("vocab", []))
-
+    rows = []
     with torch.no_grad():
-        # Batched image encode — one row per analysis frame, L2-normalized
-        # so the engine's cosine is a plain dot product shape.
-        imgs = torch.stack(
-            [preprocess(Image.fromarray(f)) for f in frames]
-        )
-        emb = model.encode_image(imgs)
-        emb = torch.nn.functional.normalize(emb, dim=-1)
-        vocab_emb = torch.zeros(0, emb.shape[-1])
-        if vocab:
-            vocab_emb = torch.nn.functional.normalize(
-                model.encode_text(tokenizer(vocab)), dim=-1
-            )
-
-    doc = {
-        "embeddings": emb.float().tolist(),
-        "vocab_embeddings": vocab_emb.float().tolist(),
-    }
+        for batch in decode_batches(params["video"], int(params["size"]), float(params["fps"])):
+            imgs = torch.stack([preprocess(Image.fromarray(f)) for f in batch])
+            emb = torch.nn.functional.normalize(model.encode_image(imgs), dim=-1)
+            rows.extend(emb.float().tolist())
+        if not rows:
+            fail("ffmpeg produced no frames")
+        vocab_rows = []
+        for start in range(0, len(vocab), 32):
+            encoded = model.encode_text(tokenizer(vocab[start:start + 32]))
+            vocab_rows.extend(torch.nn.functional.normalize(encoded, dim=-1).float().tolist())
+    doc = {"embeddings": rows, "vocab_embeddings": vocab_rows}
     with open(out, "w") as f:
         json.dump(doc, f)
 

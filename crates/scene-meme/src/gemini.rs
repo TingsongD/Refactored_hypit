@@ -43,6 +43,37 @@ pub struct GeminiAnalysis {
     pub drop: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl GeminiAnalysis {
+    /// A window retry replaces only that beat; the full analysis stays available.
+    pub fn merge_window(&mut self, id: &str, update: Self) {
+        if !update.beats.iter().any(|b| b.id == id) {
+            return;
+        }
+        self.beats.retain(|b| b.id != id);
+        self.beats
+            .extend(update.beats.into_iter().filter(|b| b.id == id));
+        self.beats
+            .sort_by(|a, b| a.t.total_cmp(&b.t).then(a.id.cmp(&b.id)));
+        self.drop.retain(|entry| entry != id);
+        self.drop
+            .extend(update.drop.into_iter().filter(|entry| entry == id));
+        for text in update.text_on_screen {
+            if !self.text_on_screen.contains(&text) {
+                self.text_on_screen.push(text);
+            }
+        }
+        self.usage = update.usage;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,11 +95,16 @@ fn yes() -> bool {
 
 /// One materialized file for a keep — path is relative to the request
 /// `out` dir so the doc stays self-describing.
+#[derive(Default)]
 pub struct KeepFile {
     pub id: String,
     pub t: f64,
     pub frame: u64,
     pub file: PathBuf,
+    pub representative_t: f64,
+    pub cut_on_beat: bool,
+    pub onset: f64,
+    pub word: Option<String>,
 }
 
 /// Extract one full-res PNG per keep: `ffmpeg -ss {t} -i src -frames:v 1`.
@@ -83,24 +119,36 @@ pub fn materialize_stills(
     let mut files = Vec::new();
     for k in keeps {
         let file = dir.join(format!("{}.png", k.id));
+        let staged = scene_media::StagedOutput::new(&file).map_err(MemeError::io(&file))?;
         let mut cmd = Command::new(&tool);
-        cmd.args(["-y", "-v", "error", "-ss", &format!("{:.6}", k.t)])
-            .arg("-i")
-            .arg(video)
-            .args(["-frames:v", "1", "-f", "image2"])
-            .arg(&file);
+        cmd.args([
+            "-y",
+            "-v",
+            "error",
+            "-ss",
+            &format!("{:.6}", k.representative_t),
+        ])
+        .arg("-i")
+        .arg(video)
+        .args(["-frames:v", "1", "-f", "image2"])
+        .arg(staged.path());
         let out = output_timeout(&mut cmd, "ffmpeg", EXTRACT_LIMIT)?;
-        if !out.status.success() || !file.exists() {
+        if !out.status.success() || !staged.path().exists() {
             return Err(MemeError::Media(MediaError::Failed {
                 tool: "ffmpeg",
                 status: out.status.to_string(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             }));
         }
+        staged.publish().map_err(MemeError::io(&file))?;
         files.push(KeepFile {
             id: k.id.clone(),
             t: k.t,
             frame: k.frame,
+            representative_t: k.representative_t,
+            cut_on_beat: k.cut_on_beat,
+            onset: k.onset,
+            word: k.word.clone(),
             file,
         });
     }
@@ -124,6 +172,7 @@ pub fn materialize_windows(
         let file = dir.join(format!("{}.mp4", k.id));
         let from = (k.t - w / 2.0).max(0.0);
         let to = k.t + w / 2.0;
+        let staged = scene_media::StagedOutput::new(&file).map_err(MemeError::io(&file))?;
         let mut cmd = Command::new(&tool);
         cmd.args([
             "-y",
@@ -147,19 +196,24 @@ pub fn materialize_windows(
             "yuv420p",
             "-an",
         ])
-        .arg(&file);
+        .arg(staged.path());
         let out = output_timeout(&mut cmd, "ffmpeg", EXTRACT_LIMIT)?;
-        if !out.status.success() || !file.exists() {
+        if !out.status.success() || !staged.path().exists() {
             return Err(MemeError::Media(MediaError::Failed {
                 tool: "ffmpeg",
                 status: out.status.to_string(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             }));
         }
+        staged.publish().map_err(MemeError::io(&file))?;
         files.push(KeepFile {
             id: k.id.clone(),
             t: k.t,
             frame: k.frame,
+            representative_t: k.representative_t,
+            cut_on_beat: k.cut_on_beat,
+            onset: k.onset,
+            word: k.word.clone(),
             file,
         });
     }
@@ -181,7 +235,7 @@ fn prompt(brief: &Brief, mode: GeminiMode, files: &[KeepFile]) -> String {
     };
     let list = files
         .iter()
-        .map(|f| format!("{} (t={:.2}, frame {})", f.id, f.t, f.frame))
+        .map(|f| format!("{} (beat_t={:.6}, representative_t={:.6}, frame {}, cut_on_beat={}, onset={}, word={:?})", f.id, f.t, f.representative_t, f.frame, f.cut_on_beat, f.onset, f.word))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -205,7 +259,8 @@ pub fn gemini_doc(brief: &Brief, mode: GeminiMode, files: &[KeepFile]) -> Value 
     json!({
         "task": "gemini_analyze",
         "mode": mode_s,
-        "model_env": "GEMINI_MODEL",
+        "model": brief.gemini_model,
+        "max_output_tokens": brief.max_output_tokens,
         "brief": {
             "job": brief.job,
             "description": brief.description,
@@ -217,6 +272,10 @@ pub fn gemini_doc(brief: &Brief, mode: GeminiMode, files: &[KeepFile]) -> Value 
                 "id": f.id,
                 "t": f.t,
                 "frame": f.frame,
+                "representative_t": f.representative_t,
+                "cut_on_beat": f.cut_on_beat,
+                "onset": f.onset,
+                "word": f.word,
                 "file": f.file.display().to_string(),
             }))
             .collect::<Vec<_>>(),
@@ -277,14 +336,18 @@ mod tests {
             KeepFile {
                 id: "f30".into(),
                 t: 1.0,
+                representative_t: 1.0,
                 frame: 30,
                 file: PathBuf::from("frames/f30.png"),
+                ..Default::default()
             },
             KeepFile {
                 id: "f60".into(),
                 t: 2.0,
+                representative_t: 2.0,
                 frame: 60,
                 file: PathBuf::from("frames/f60.png"),
+                ..Default::default()
             },
         ];
         let doc = gemini_doc(&Brief::default(), GeminiMode::Stills, &files);

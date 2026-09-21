@@ -62,6 +62,7 @@ pub struct RouteOutcome {
 pub fn route_doc(pack: &Value, brief: &Brief) -> Value {
     serde_json::json!({
         "task": "jev_route",
+        "model": brief.jev_model,
         "brief": {
             "job": brief.job,
             "description": brief.description,
@@ -88,6 +89,15 @@ pub fn parse_answers(text: &str, cands: &[Candidate]) -> Result<RouteOutcome, Me
     }
     let reply: Reply = serde_json::from_str(text)
         .map_err(|e| MemeError::Stage(format!("jev route response is not valid JSON: {e}")))?;
+    if reply.answers.values().any(|a| {
+        !(1..=5).contains(&a.cut_strength)
+            || !(0.0..=1.0).contains(&a.too_similar)
+            || !(0.0..=1.0).contains(&a.confidence)
+    }) {
+        return Err(MemeError::Stage(
+            "jev routing values are outside their ranges".into(),
+        ));
+    }
     Ok(apply_keep_rule(&reply.answers, cands))
 }
 
@@ -161,6 +171,7 @@ mod tests {
             id: format!("f{i}"),
             frame: i,
             t: i as f64 / 30.0,
+            representative_t: i as f64 / 30.0,
             change: 0.5,
             sharpness: 0.9,
             motion: 0.5,

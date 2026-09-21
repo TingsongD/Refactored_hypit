@@ -17,10 +17,10 @@ use crate::peaks::Candidate;
 /// Beat re-encode is one-shot ffmpeg per keep.
 const BEAT_LIMIT: Duration = Duration::from_secs(120);
 
-/// Seconds-typed anchor literal, ms-rounded — `AnchorRange::parse`
+/// Seconds-typed anchor literal, nanosecond-rounded — `AnchorRange::parse`
 /// grammar.
 fn t(s: f64) -> String {
-    format!("{:.3}s", (s * 1000.0).round() / 1000.0)
+    format!("{s:.9}s")
 }
 
 fn esc_attr(s: &str) -> String {
@@ -52,25 +52,23 @@ pub fn beat_spans(keeps: &[&Candidate], beat_sec: f64, duration_s: f64) -> Vec<B
     let mut sorted: Vec<&Candidate> = keeps.to_vec();
     sorted.sort_by(|a, b| a.t.total_cmp(&b.t));
     let mut out = Vec::new();
-    for (i, k) in sorted.iter().enumerate() {
-        let mut from = (k.t - beat_sec / 2.0).max(0.0);
-        let mut to = (k.t + beat_sec / 2.0).min(duration_s);
-        // Tail keeps clamp left; never emit a degenerate or reversed cut.
-        if to - from < 0.05 {
-            to = (from + beat_sec).min(duration_s);
-            from = (to - beat_sec).max(0.0);
-        }
-        if to - from < 0.05 {
-            continue;
-        }
+    if !beat_sec.is_finite() || beat_sec <= 0.0 || !duration_s.is_finite() || duration_s <= 0.0 {
+        return out;
+    }
+    let width = beat_sec.min(duration_s);
+    let mut cursor = 0.0;
+    for k in &sorted {
+        let from = (k.t - width / 2.0).clamp(0.0, (duration_s - width).max(0.0));
+        let to = (from + width).min(duration_s);
         out.push(BeatSpan {
             id: k.id.clone(),
             src_from: from,
             src_to: to,
-            start: i as f64 * beat_sec,
-            end: (i + 1) as f64 * beat_sec,
+            start: cursor,
+            end: cursor + (to - from),
             file: None,
         });
+        cursor += to - from;
     }
     out
 }
@@ -87,6 +85,7 @@ pub fn materialize_beats(
     let tool = std::env::var("FFMPEG").unwrap_or_else(|_| Tool::Ffmpeg.name().to_string());
     for (i, s) in spans.iter_mut().enumerate() {
         let file = dir.join(format!("beat_{i:02}.mp4"));
+        let staged = scene_media::StagedOutput::new(&file).map_err(MemeError::io(&file))?;
         let mut cmd = Command::new(&tool);
         cmd.args([
             "-y",
@@ -102,15 +101,16 @@ pub fn materialize_beats(
         .args([
             "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac",
         ])
-        .arg(&file);
+        .arg(staged.path());
         let out = output_timeout(&mut cmd, "ffmpeg", BEAT_LIMIT)?;
-        if !out.status.success() || !file.exists() {
+        if !out.status.success() || !staged.path().exists() {
             return Err(MemeError::Media(MediaError::Failed {
                 tool: "ffmpeg",
                 status: out.status.to_string(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             }));
         }
+        staged.publish().map_err(MemeError::io(&file))?;
         s.file = Some(file);
     }
     Ok(())
@@ -160,9 +160,9 @@ pub fn emit_flash_scene(spans: &[BeatSpan], spec: &EmitSpec) -> String {
 
     // Audio follows the picture — one sound slice per beat from the same
     // source window (materialized beats already carry their audio).
-    if spec.has_audio {
+    if spec.has_audio || spec.music_src.is_some() {
         out.push_str("  <track kind=\"audio\">\n");
-        for s in spans {
+        for s in spans.iter().filter(|_| spec.has_audio) {
             let (beat_src, from) = match &s.file {
                 Some(f) => (esc_attr(&f.display().to_string()), String::new()),
                 None => (src.clone(), format!(" from=\"{}\"", t(s.src_from))),
@@ -200,6 +200,7 @@ mod tests {
             id: format!("f{i}"),
             frame: i,
             t,
+            representative_t: t,
             change: 0.5,
             sharpness: 0.9,
             motion: 0.5,

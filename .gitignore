@@ -7,3 +7,7 @@
 # Project-level outputs inside example/user scenes.
 out/
 cache/
+
+# Python adapter test bytecode.
+__pycache__/
+*.pyc

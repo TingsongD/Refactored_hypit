@@ -774,12 +774,24 @@ pub fn meme(
         rerun_window: rerun_window.map(str::to_string),
         music_src: music.map(str::to_string),
     };
-    match scene_meme::run::run(&opts) {
+    let mut progress = |st: &scene_meme::run::StageLog| {
+        use std::io::Write;
+        let hit = if st.cache_hit { "cached" } else { st.phase };
+        println!("  {:<12} {:>6}ms  {hit}  {}", st.stage, st.ms, st.note);
+        if let Some(input) = st.input_tokens {
+            let cost = st
+                .estimated_cost_usd
+                .map(|c| format!("${c:.6}"))
+                .unwrap_or_else(|| "unavailable (prices not configured)".into());
+            println!(
+                "    tokens: input={input}, output={}; cost={cost}",
+                st.output_tokens.unwrap_or(0)
+            );
+        }
+        let _ = std::io::stdout().flush();
+    };
+    match scene_meme::run::run_with_progress(&opts, &mut progress) {
         Ok(report) => {
-            for st in &report.stages {
-                let hit = if st.cache_hit { "cached" } else { "ran" };
-                println!("  {:<12} {:>6}ms  {hit}  {}", st.stage, st.ms, st.note);
-            }
             for w in &report.warnings {
                 eprintln!("warning: {w}");
             }
@@ -1150,7 +1162,7 @@ mod tests {
         // only resolves from the cwd.
         assert_eq!(
             adapt_src(Path::new("source.mp4"), Path::new("nested")),
-            "../source.mp4"
+            Path::new("..").join("source.mp4").display().to_string()
         );
         // Sibling trees climb then descend.
         assert_eq!(

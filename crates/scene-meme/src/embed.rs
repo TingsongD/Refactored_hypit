@@ -27,6 +27,30 @@ pub struct EmbedOut {
     pub vocab_embeddings: Vec<Vec<f32>>,
 }
 
+impl EmbedOut {
+    pub fn validate(&self, frames: usize, labels: usize) -> Result<(), MemeError> {
+        let dimension = self.embeddings.first().map(Vec::len).unwrap_or(0);
+        if self.embeddings.len() != frames
+            || self.vocab_embeddings.len() != labels
+            || dimension == 0
+            || self
+                .embeddings
+                .iter()
+                .chain(&self.vocab_embeddings)
+                .any(|row| {
+                    row.len() != dimension
+                        || row.iter().any(|x| !x.is_finite())
+                        || row.iter().all(|x| *x == 0.0)
+                })
+        {
+            return Err(MemeError::Stage(
+                "invalid embedding frame/vocabulary dimensions or values".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Cosine similarity −1..1 — normalized so both unit-scales of encoder
 /// output behave identically.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -75,6 +99,8 @@ pub fn run_embed(
             "size": brief.perceive_size,
             "fps": brief.fps,
             "vocab": brief.tag_vocab,
+            "model": brief.embedding_model,
+            "weights_id": brief.weights_id,
         }),
         out,
     };
@@ -82,27 +108,7 @@ pub fn run_embed(
     let text = std::fs::read_to_string(&produced).map_err(MemeError::io(&produced))?;
     let parsed: EmbedOut = serde_json::from_str(&text)
         .map_err(|e| MemeError::Stage(format!("embed response is not valid JSON: {e}")))?;
-    if parsed.embeddings.len() != frames {
-        return Err(MemeError::Stage(format!(
-            "embed returned {} rows for {frames} frames",
-            parsed.embeddings.len()
-        )));
-    }
-    if !parsed.embeddings.is_empty()
-        && parsed
-            .embeddings
-            .iter()
-            .any(|e| e.len() != parsed.embeddings[0].len())
-    {
-        return Err(MemeError::Stage("embed rows have inconsistent dims".into()));
-    }
-    if parsed.vocab_embeddings.len() != brief.tag_vocab.len() {
-        return Err(MemeError::Stage(format!(
-            "embed returned {} vocab rows for {} labels",
-            parsed.vocab_embeddings.len(),
-            brief.tag_vocab.len()
-        )));
-    }
+    parsed.validate(frames, brief.tag_vocab.len())?;
     Ok(Some(parsed))
 }
 
@@ -205,6 +211,7 @@ mod tests {
             id: "f0".into(),
             frame: 0,
             t: 0.0,
+            representative_t: 0.0,
             change: 0.5,
             sharpness: 0.9,
             motion: 0.5,

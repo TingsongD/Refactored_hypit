@@ -22,7 +22,7 @@ pub struct Cache {
 impl Cache {
     pub fn new(out_dir: &Path) -> Cache {
         Cache {
-            dir: out_dir.join(".cache"),
+            dir: out_dir.join(".cache").join("v2"),
         }
     }
 
@@ -48,19 +48,17 @@ impl Cache {
         Ok(format!("{:x}", h.finalize()))
     }
 
-    /// A stage key from its inputs: `{stage}-{hash16}` where the hash
-    /// covers every input, joined with NULs so `["ab","c"]` and
+    /// A stage key from its inputs: `{stage}-{sha256}` where the hash
+    /// covers length-prefixed inputs so `["ab","c"]` and
     /// `["a","bc"]` can't collide.
     pub fn key(stage: &str, inputs: &[&str]) -> String {
         let mut h = Sha256::new();
+        h.update(b"scene-cache-v2");
         for part in inputs {
-            h.update([0u8]);
+            h.update((part.len() as u64).to_le_bytes());
             h.update(part.as_bytes());
         }
         format!("{stage}-{:x}", h.finalize())
-            .chars()
-            .take(stage.len() + 1 + 16)
-            .collect()
     }
 
     /// Read a cached value. A missing or corrupt entry is a miss, not
@@ -74,15 +72,18 @@ impl Cache {
     /// Write a stage output — temp file + rename so a crash mid-write
     /// can't leave a half-JSON that `get` would later misread.
     pub fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<(), MemeError> {
-        fs::create_dir_all(&self.dir).map_err(MemeError::io(&self.dir))?;
         let path = self.path(key);
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        let text = serde_json::to_string(value)
+        let text = serde_json::to_vec(value)
             .map_err(|e| MemeError::Stage(format!("cache serialize {key}: {e}")))?;
-        fs::write(&tmp, &text).map_err(MemeError::io(&tmp))?;
-        fs::rename(&tmp, &path).map_err(MemeError::io(&path))?;
-        Ok(())
+        write_atomic(&path, &text)
     }
+}
+
+/// Publish only a complete file; failed writes leave previous results intact.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), MemeError> {
+    let staged = scene_media::StagedOutput::new(path).map_err(MemeError::io(path))?;
+    fs::write(staged.path(), bytes).map_err(MemeError::io(path))?;
+    staged.publish().map_err(MemeError::io(path))
 }
 
 #[cfg(test)]

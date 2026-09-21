@@ -33,6 +33,7 @@ pub struct Candidate {
     pub id: String,
     pub frame: u64,
     pub t: f64,
+    pub representative_t: f64,
     pub change: f64,
     pub sharpness: f64,
     pub motion: f64,
@@ -59,7 +60,7 @@ pub struct Candidate {
 
 /// Similarity between two frames: cosine on embeddings when present,
 /// else `1 - hamming(dhash)/64`. Both land in 0..1 where 1 is identical.
-fn similarity(p: &Perceive, emb: Option<&[Vec<f32>]>, a: u64, b: u64) -> f64 {
+pub(crate) fn similarity(p: &Perceive, emb: Option<&[Vec<f32>]>, a: u64, b: u64) -> f64 {
     if let Some(emb) = emb
         && let (Some(x), Some(y)) = (emb.get(a as usize), emb.get(b as usize))
     {
@@ -73,7 +74,7 @@ fn similarity(p: &Perceive, emb: Option<&[Vec<f32>]>, a: u64, b: u64) -> f64 {
         }
         let denom = (na * nb).sqrt();
         if denom > 0.0 {
-            return (dot / denom).clamp(-1.0, 1.0).mul_add(0.5, 0.5); // → 0..1
+            return (dot / denom).clamp(-1.0, 1.0); // → 0..1
         }
     }
     // Two frames must match in BOTH structure (dHash) and level (luma)
@@ -177,7 +178,7 @@ pub fn pick_peaks(
     );
     raw.extend(
         (0..n)
-            .filter(|&i| p.audio[i].onset > 0.0)
+            .filter(|&i| p.audio[i].onset > 0.0 && onset_norm(i) >= brief.onset_keep)
             .map(|i| (i, PeakSource::Audio)),
     );
     raw.extend(
@@ -226,8 +227,16 @@ pub fn pick_peaks(
         // Representative frame: sharpest in the window. Visual beats
         // look forward of the cut (the boundary frame is often smear);
         // audio beats look ±snap so the still stays on the beat.
-        let rep = if has_visual {
-            argmax_near(base, base + gap, n, base, |i| p.frames[i].sharpness)
+        let rep = if !brief.snap_to_sharp {
+            base
+        } else if has_visual {
+            argmax_near(
+                base,
+                base.saturating_add(gap).saturating_sub(1),
+                n,
+                base,
+                |i| p.frames[i].sharpness,
+            )
         } else {
             argmax_near(base.saturating_sub(snap), base + snap, n, base, |i| {
                 p.frames[i].sharpness
@@ -252,31 +261,24 @@ pub fn pick_peaks(
         let mut t = base as f64 / p.fps;
         let snap_s = snap as f64 / p.fps;
         let onset_t = (base.saturating_sub(snap)..=(base + snap).min(n - 1))
-            .filter(|&i| p.audio[i].onset > 0.0)
+            .filter(|&i| {
+                brief.snap_to_onset && p.audio[i].onset > 0.0 && onset_norm(i) >= brief.onset_keep
+            })
             .map(|i| (i as f64 / p.fps, i))
             .min_by(|a, b| (a.0 - t).abs().total_cmp(&(b.0 - t).abs()));
         let mut onset_strength = 0.0;
         if let Some((ot, oi)) = onset_t {
             t = ot;
             onset_strength = onset_norm(oi);
-        } else if let Some(w) = words
-            .iter()
-            .filter(|w| (w.start_s - t).abs() <= snap_s)
-            .min_by(|a, b| (a.start_s - t).abs().total_cmp(&(b.start_s - t).abs()))
+        } else if brief.snap_to_onset
+            && let Some(w) = words
+                .iter()
+                .filter(|w| (w.start_s - t).abs() <= snap_s)
+                .min_by(|a, b| (a.start_s - t).abs().total_cmp(&(b.start_s - t).abs()))
         {
             t = w.start_s;
         }
         let word = word_at(words, t).map(|w| w.text.clone());
-
-        // Dedup against keeps so far: the strongest similarity to an
-        // already-kept frame is recorded and gated.
-        let sim_to_kept = keeps
-            .iter()
-            .map(|k| similarity(p, emb, rep as u64, k.frame))
-            .fold(0.0, f64::max);
-        if sim_to_kept > brief.dup_cosine {
-            continue;
-        }
 
         let importance = imp[rep]
             + if cut_on_beat {
@@ -294,6 +296,7 @@ pub fn pick_peaks(
             id: format!("f{rep}"),
             frame: rep as u64,
             t,
+            representative_t: f.t,
             // `change` is the beat's strength — the spike at `base`, not
             // the rep still's own (post-cut) inter-frame delta.
             change: p.frames[base].change,
@@ -307,11 +310,37 @@ pub fn pick_peaks(
             onset: onset_strength,
             word,
             source,
-            sim_to_kept,
+            sim_to_kept: 0.0,
             tags: Vec::new(),
         });
     }
-    keeps
+    keeps.sort_by(|a, b| {
+        b.importance
+            .total_cmp(&a.importance)
+            .then(b.sharpness.total_cmp(&a.sharpness))
+            .then(b.change.total_cmp(&a.change))
+            .then(a.frame.cmp(&b.frame))
+    });
+    let mut selected: Vec<Candidate> = Vec::new();
+    for candidate in keeps {
+        if selected
+            .iter()
+            .all(|other| similarity(p, emb, candidate.frame, other.frame) <= brief.dup_cosine)
+        {
+            selected.push(candidate);
+        }
+    }
+    for i in 0..selected.len() {
+        selected[i].sim_to_kept = selected
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, other)| similarity(p, emb, selected[i].frame, other.frame))
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
+    }
+    selected.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.frame.cmp(&b.frame)));
+    selected
 }
 
 #[cfg(test)]

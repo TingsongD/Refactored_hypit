@@ -129,6 +129,9 @@ fn parse_number_unit(s: &str) -> Option<(f64, OffsetUnit, usize)> {
         return None;
     }
     let value: f64 = s[..i].parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
     let (unit, ulen) = match s.as_bytes().get(i) {
         Some(b's') => (OffsetUnit::Seconds, 1),
         Some(b'f') => (OffsetUnit::Frames, 1),

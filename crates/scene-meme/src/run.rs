@@ -1,62 +1,51 @@
-//! `run` — the pipeline in order: probe → perceive → (embed) → peaks →
-//! pack → jev_route → gemini → jev_package → emit. Every stage reads
-//! its inputs' content hash into a cache key, so a retry reuses exactly
-//! the stages whose inputs haven't moved. Absent `jev`/`gemini`
-//! capabilities degrade the run, not fail it: keeps become every
-//! peak-pick survivor and the package decision falls back to code.
+//! Content-addressed flash-cut stages. Provider responses and generated assets
+//! publish only after validation; progress is observable before external calls.
 
+use crate::brief::Brief;
+use crate::cache::{Cache, write_atomic};
+use crate::embed::{EmbedOut, apply_embeddings, run_embed, tag_candidates};
+use crate::emit::{EmitSpec, beat_spans, emit_flash_scene, materialize_beats};
+use crate::error::MemeError;
+use crate::gemini::{self, GeminiAnalysis, GeminiMode};
+use crate::metrics::words_of;
+use crate::pack::score_pack;
+use crate::package::{Package, PackageOutcome};
+use crate::peaks::{Candidate, pick_peaks};
+use crate::perceive::{Perceive, perceive};
+use crate::{jev, package};
+use scene_cap::{Connector, Registry};
+use scene_media::{StagedOutput, probe};
+use scene_time::TimingMap;
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use scene_cap::Registry;
-use scene_media::probe;
-use scene_time::{TimingMap, Word};
-use serde::Serialize;
-
-use crate::brief::Brief;
-use crate::cache::Cache;
-use crate::embed::{apply_embeddings, run_embed, tag_candidates};
-use crate::emit::{EmitSpec, beat_spans, emit_flash_scene, materialize_beats};
-use crate::error::MemeError;
-use crate::gemini::{self, GeminiAnalysis, GeminiMode, KeepFile};
-use crate::jev;
-use crate::metrics::words_of;
-use crate::pack::score_pack;
-use crate::package::{self, Package, PackageOutcome};
-use crate::peaks::{Candidate, pick_peaks};
-use crate::perceive::{Perceive, perceive};
-
-/// Package-driven window reruns are bounded — a connector that always
-/// says rerun can't spin forever.
 const MAX_RERUNS: usize = 2;
 
 pub struct RunOpts<'a> {
     pub input: &'a Path,
     pub brief: &'a Brief,
-    /// Where metrics/peaks/keeps/gemini/package/scene land, plus `.cache/`.
     pub out: &'a Path,
-    /// Word lattice from `engine align` — empty map = no word snapping.
     pub timings: TimingMap,
-    /// Capability registry — `None` runs the whole pipeline offline.
     pub registry: Option<&'a Registry>,
-    /// Program seconds per beat.
     pub beat_sec: f64,
-    /// Physically cut beats to `out/beats/` instead of `from` offsets.
     pub materialize: bool,
     pub gemini_mode: GeminiMode,
-    /// Force a one-window Gemini rerun on this keep id (retry entry point).
     pub rerun_window: Option<String>,
-    /// Optional bed under the montage.
     pub music_src: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StageLog {
     pub stage: &'static str,
+    pub phase: &'static str,
     pub ms: u128,
     pub cache_hit: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
     pub note: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,498 +62,455 @@ pub struct RunReport {
     pub stages: Vec<StageLog>,
 }
 
-/// JSON files the run writes at `out/` (mirrors the spec's §11 layout).
-fn write_json(out: &Path, name: &str, v: &impl Serialize) -> Result<(), MemeError> {
-    let path = out.join(format!("{name}.json"));
-    let text = serde_json::to_string_pretty(v)
-        .map_err(|e| MemeError::Stage(format!("serialize {name}: {e}")))?;
-    write_atomic(&path, text.as_bytes())
+struct Recorder<'a> {
+    stages: Vec<StageLog>,
+    progress: &'a mut dyn FnMut(&StageLog),
 }
-
-/// Temp-file + rename — a crash mid-write can't leave a half document.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), MemeError> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(MemeError::io(dir))?;
+impl Recorder<'_> {
+    fn record(&mut self, stage: &'static str, start: Instant, hit: bool, note: String) {
+        self.emit(StageLog {
+            stage,
+            phase: "complete",
+            ms: start.elapsed().as_millis(),
+            cache_hit: hit,
+            note,
+            input_tokens: None,
+            output_tokens: None,
+            estimated_cost_usd: None,
+        });
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(MemeError::io(&tmp))?;
-    std::fs::rename(&tmp, path).map_err(MemeError::io(path))?;
-    Ok(())
-}
-
-/// The scene's `src` must resolve under the scene's own dir at render
-/// time (confinement). Copy the input into `out/` as `source.<ext>`
-/// unless it's already inside — same trick `adapt` uses.
-fn place_source(input: &Path, out: &Path) -> Result<String, MemeError> {
-    let canon_in = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
-    let canon_out = out.canonicalize().unwrap_or_else(|_| out.to_path_buf());
-    if canon_in.starts_with(&canon_out) {
-        return canon_in
-            .strip_prefix(&canon_out)
-            .map(|r| r.display().to_string())
-            .map_err(|_| MemeError::Stage("source path strip".into()));
+    fn emit(&mut self, event: StageLog) {
+        (self.progress)(&event);
+        self.stages.push(event);
     }
-    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-    let dest = out.join(format!("source.{ext}"));
-    if !dest.exists() {
-        std::fs::copy(input, &dest).map_err(MemeError::io(&dest))?;
-    }
-    Ok(format!("source.{ext}"))
 }
 
-fn hash_str(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(s.as_bytes()))
-        .chars()
-        .take(16)
-        .collect()
+fn write_json(out: &Path, name: &str, value: &impl Serialize) -> Result<(), MemeError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| MemeError::Stage(e.to_string()))?;
+    write_atomic(&out.join(format!("{name}.json")), &bytes)
+}
+fn key(stage: &str, value: &impl Serialize) -> String {
+    Cache::key(
+        stage,
+        &[&serde_json::to_string(value).expect("validated stage inputs serialize")],
+    )
 }
 
-fn materialize(
-    mode: GeminiMode,
-    video: &Path,
-    keeps: &[&Candidate],
-    out: &Path,
-    brief: &Brief,
-) -> Result<Vec<KeepFile>, MemeError> {
-    match mode {
-        GeminiMode::Stills => gemini::materialize_stills(video, keeps, &out.join("frames")),
-        GeminiMode::Windows => {
-            gemini::materialize_windows(video, keeps, &out.join("windows"), brief)
+/// The request contract and connector implementation are inputs; auth values are not.
+fn connector_identity(registry: Option<&Registry>, name: &str) -> Value {
+    match registry.and_then(|r| r.get(name)).map(|c| &c.connector) {
+        Some(Connector::Http { endpoint }) => json!({"endpoint": endpoint.split('?').next()}),
+        Some(Connector::Subprocess { argv }) => {
+            let files: Vec<_> = argv
+                .iter()
+                .flat_map(|arg| [PathBuf::from(arg), PathBuf::from(arg).with_extension("py")])
+                .filter(|arg| arg.is_file())
+                .map(|arg| json!({"path":arg,"sha256":Cache::file_sha256(&arg).ok()}))
+                .collect();
+            json!({"argv":argv,"files":files,"gateway":std::env::var("JEV_ENDPOINT").ok()})
         }
+        None => Value::Null,
     }
 }
 
-/// Everything a Gemini call needs — bundled so both the full pass and
-/// single-window reruns share one shape.
+/// Import by content, never by a reused basename. Old scenes retain their assets.
+fn place_source(input: &Path, out: &Path) -> Result<String, MemeError> {
+    let hash = Cache::file_sha256(input)?;
+    let ext = input.extension().and_then(|x| x.to_str()).unwrap_or("bin");
+    let relative = format!("assets/{hash}.{ext}");
+    let dest = out.join(&relative);
+    if !dest.is_file() || Cache::file_sha256(&dest)? != hash {
+        let staged = StagedOutput::new(&dest).map_err(MemeError::io(&dest))?;
+        std::fs::copy(input, staged.path()).map_err(MemeError::io(input))?;
+        staged.publish().map_err(MemeError::io(&dest))?;
+    }
+    Ok(relative)
+}
+
+fn cached<T: Serialize + DeserializeOwned>(
+    cache: &Cache,
+    key: &str,
+    make: impl FnOnce(&Path) -> Result<T, MemeError>,
+) -> Result<(T, bool), MemeError> {
+    if let Some(value) = cache.get(key) {
+        return Ok((value, true));
+    }
+    // Raw connector replies never occupy the normalized cache entry.
+    let target = cache.path(key);
+    let stage = StagedOutput::new(&target).map_err(MemeError::io(&target))?;
+    let value = make(stage.path())?;
+    cache.put(key, &value)?;
+    Ok((value, false))
+}
+
 struct GeminiCtx<'a> {
     reg: &'a Registry,
     video: &'a Path,
+    video_sha: &'a str,
     brief: &'a Brief,
     mode: GeminiMode,
     out: &'a Path,
     cache: &'a Cache,
-    model_tag: &'a str,
 }
-
 impl GeminiCtx<'_> {
-    /// Gemini for one keep — the unit of a `rerun_window` retry. Its
-    /// cache key covers just that keep, so a window rerun can't disturb
-    /// the rest.
-    fn one(&self, keep: &Candidate) -> Result<(GeminiAnalysis, bool), MemeError> {
-        let key = Cache::key(
-            "gemini-win",
-            &[&keep.id, &self.brief.hash(), self.model_tag],
+    fn analyze(
+        &self,
+        keeps: &[&Candidate],
+        force: bool,
+        log: &mut Recorder<'_>,
+    ) -> Result<GeminiAnalysis, MemeError> {
+        let mode = match self.mode {
+            GeminiMode::Stills => "stills",
+            GeminiMode::Windows => "windows",
+        };
+        let cache_key = key(
+            "gemini",
+            &json!({"video":self.video_sha,"keeps":keeps,"brief":self.brief,
+            "mode":mode,"prompt_version":2,"connector":connector_identity(Some(self.reg), &self.brief.gemini_cap)}),
         );
-        if let Some(a) = self.cache.get::<GeminiAnalysis>(&key) {
-            return Ok((a, true));
+        let started = Instant::now();
+        if !force && let Some(a) = self.cache.get::<GeminiAnalysis>(&cache_key) {
+            log.record("gemini", started, true, format!("{} {mode}", keeps.len()));
+            return Ok(a);
         }
-        let files = materialize(self.mode, self.video, &[keep], self.out, self.brief)?;
-        let a = gemini::analyze(
+        let dir = self.out.join("analysis").join(&cache_key);
+        let files = match self.mode {
+            GeminiMode::Stills => gemini::materialize_stills(self.video, keeps, &dir)?,
+            GeminiMode::Windows => {
+                gemini::materialize_windows(self.video, keeps, &dir, self.brief)?
+            }
+        };
+        let request = gemini::gemini_doc(self.brief, self.mode, &files);
+        let image_count = match self.mode {
+            GeminiMode::Stills => keeps.len() as f64,
+            GeminiMode::Windows => {
+                keeps.len() as f64 * self.brief.gemini_window_sec * self.brief.gemini_fps
+            }
+        };
+        let input_tokens = (request["prompt"].as_str().unwrap_or("").len() as u64).div_ceil(4)
+            + (image_count * 258.0).ceil() as u64;
+        let output_tokens = u64::from(self.brief.max_output_tokens);
+        let cost = |input: u64, output: u64| {
+            self.brief
+                .input_price_per_million
+                .zip(self.brief.output_price_per_million)
+                .map(|(a, b)| (a * input as f64 + b * output as f64) / 1_000_000.0)
+        };
+        log.emit(StageLog { stage:"gemini",phase:"preflight",ms:0,cache_hit:false,
+            note:"approximate input tokens; output is configured cap; monetary estimate unavailable unless prices are configured".into(),
+            input_tokens:Some(input_tokens),output_tokens:Some(output_tokens),estimated_cost_usd:cost(input_tokens,output_tokens) });
+        let target = self.cache.path(&cache_key);
+        let staging = StagedOutput::new(&target).map_err(MemeError::io(&target))?;
+        let result = gemini::analyze(
             self.reg,
             &self.brief.gemini_cap,
             self.brief,
             self.mode,
             &files,
-            &self.cache.path(&key),
+            staging.path(),
         )?;
-        self.cache.put(&key, &a)?;
-        Ok((a, false))
+        if result.beats.is_empty()
+            || result
+                .beats
+                .iter()
+                .any(|b| !b.t.is_finite() || !keeps.iter().any(|k| k.id == b.id))
+        {
+            return Err(MemeError::Stage(
+                "gemini returned empty or unknown beats; retry this analysis".into(),
+            ));
+        }
+        self.cache.put(&cache_key, &result)?;
+        log.emit(StageLog {
+            stage: "gemini",
+            phase: "complete",
+            ms: started.elapsed().as_millis(),
+            cache_hit: false,
+            note: format!("{} {mode}", keeps.len()),
+            input_tokens: result.usage.as_ref().map(|u| u.input_tokens),
+            output_tokens: result.usage.as_ref().map(|u| u.output_tokens),
+            estimated_cost_usd: result
+                .usage
+                .as_ref()
+                .and_then(|u| cost(u.input_tokens, u.output_tokens)),
+        });
+        Ok(result)
     }
 }
 
 pub fn run(opts: &RunOpts) -> Result<RunReport, MemeError> {
-    let brief = opts.brief;
-    brief.validate()?;
+    run_with_progress(opts, &mut |_| {})
+}
+
+pub fn run_with_progress(
+    opts: &RunOpts,
+    progress: &mut dyn FnMut(&StageLog),
+) -> Result<RunReport, MemeError> {
+    let effective = opts.brief.effective()?;
+    let brief = &effective;
+    if !opts.beat_sec.is_finite() || opts.beat_sec < 1e-9 {
+        return Err(MemeError::Brief(
+            "beat-sec must be finite and positive".into(),
+        ));
+    }
+    for timing in opts.timings.sources.values() {
+        if !timing.validate().is_empty() {
+            return Err(MemeError::Stage("invalid word timings".into()));
+        }
+    }
+    let gemini_reg = opts.registry.filter(|r| r.get(&brief.gemini_cap).is_some());
+    if gemini_reg.is_some() && brief.gemini_model.is_none() {
+        return Err(MemeError::Brief(
+            "configured Gemini requires gemini_model or GEMINI_MODEL".into(),
+        ));
+    }
     std::fs::create_dir_all(opts.out).map_err(MemeError::io(opts.out))?;
     let cache = Cache::new(opts.out);
-    let mut stages = Vec::new();
+    let mut log = Recorder {
+        stages: Vec::new(),
+        progress,
+    };
     let mut warnings = Vec::new();
-    let mut tick = |stage: &'static str, start: Instant, hit: bool, note: String| {
-        stages.push(StageLog {
-            stage,
-            ms: start.elapsed().as_millis(),
-            cache_hit: hit,
-            note,
-        });
-    };
-
-    // ---- probe + identity ------------------------------------------------
-    let s0 = Instant::now();
+    let started = Instant::now();
     let info = probe(opts.input)?;
+    if info.video.is_none() || !info.duration_s.is_finite() || info.duration_s <= 0.0 {
+        return Err(MemeError::Stage(
+            "meme requires a video with a positive finite duration".into(),
+        ));
+    }
     let video_sha = Cache::file_sha256(opts.input)?;
-    let brief_hash = brief.hash();
-    let timings_json = serde_json::to_string(&opts.timings).unwrap_or_default();
-    let timings_hash = hash_str(&timings_json);
-    tick("probe", s0, false, String::new());
-
-    // ---- perceive --------------------------------------------------------
-    // Cached pre-embeddings: `change` is dHash space here; the embed stage
-    // rewrites it, and the peaks key carries the encoder so the two spaces
-    // can never collide downstream.
-    let s = Instant::now();
-    let metrics_key = Cache::key(
+    log.record("probe", started, false, String::new());
+    let started = Instant::now();
+    let metrics_key = key(
         "metrics",
-        &[
-            &video_sha,
-            &brief.encoder,
-            &brief.perceive_size.to_string(),
-            &brief.fps.to_string(),
-            &timings_hash,
-        ],
+        &json!({"video":video_sha,"size":brief.perceive_size,"fps":brief.fps,"timings":opts.timings}),
     );
-    let (mut p, hit) = match cache.get::<Perceive>(&metrics_key) {
-        Some(p) => (p, true),
-        None => {
-            let p = perceive(opts.input, &info, brief, &opts.timings)?;
-            cache.put(&metrics_key, &p)?;
-            (p, false)
-        }
-    };
-    tick(
+    let (mut p, hit): (Perceive, _) = cached(&cache, &metrics_key, |_| {
+        perceive(opts.input, &info, brief, &opts.timings)
+    })?;
+    log.record(
         "perceive",
-        s,
+        started,
         hit,
         format!("{} frames, audio={}", p.frames.len(), p.has_audio),
     );
-
-    // ---- embed (optional) -------------------------------------------------
-    let s = Instant::now();
-    let mut emb: Option<Vec<Vec<f32>>> = None;
-    let mut vocab_emb: Vec<Vec<f32>> = Vec::new();
+    let started = Instant::now();
+    let mut embeddings = None;
+    let mut vocab = Vec::new();
+    let mut embedding_key = "dhash".to_string();
     if brief.encoder != "dhash" {
-        let key = Cache::key("emb", &[&video_sha, &brief.encoder, &brief.fps.to_string()]);
-        let e = match cache.get::<crate::embed::EmbedOut>(&key) {
-            Some(e) => {
-                tick("embed", s, true, String::new());
-                Some(e)
-            }
-            // The connector writes its response to the cache path —
-            // a successful miss is already cached.
+        embedding_key = key(
+            "embed",
+            &json!({"video":video_sha,"size":brief.perceive_size,"fps":brief.fps,
+            "vocab":brief.tag_vocab,"model":brief.embedding_model,"weights":brief.weights_id,
+            "connector":connector_identity(opts.registry,&brief.encoder)}),
+        );
+        let valid_cached = cache
+            .get::<EmbedOut>(&embedding_key)
+            .filter(|e| e.validate(p.frames.len(), brief.tag_vocab.len()).is_ok());
+        let (e, hit) = match valid_cached {
+            Some(e) => (e, true),
             None => {
+                let target = cache.path(&embedding_key);
+                let staging = StagedOutput::new(&target).map_err(MemeError::io(&target))?;
                 let e = run_embed(
                     opts.registry,
                     opts.input,
                     brief,
                     p.frames.len(),
-                    &cache.path(&key),
-                )?;
-                tick("embed", s, false, String::new());
-                e
+                    staging.path(),
+                )?
+                .ok_or_else(|| MemeError::Stage("embedding connector missing".into()))?;
+                cache.put(&embedding_key, &e)?;
+                (e, false)
             }
         };
-        if let Some(e) = e {
-            vocab_emb = e.vocab_embeddings.clone();
-            emb = Some(e.embeddings);
-            apply_embeddings(&mut p, emb.as_deref().unwrap_or_default());
-        }
+        apply_embeddings(&mut p, &e.embeddings);
+        vocab = e.vocab_embeddings;
+        embeddings = Some(e.embeddings);
+        log.record("embed", started, hit, String::new());
     } else {
-        tick("embed", s, true, "dhash mode".into());
+        log.record("embed", started, true, "dhash mode".into());
     }
-
-    // ---- peaks -------------------------------------------------------------
-    let s = Instant::now();
-    let words: Vec<Word> = words_of(&opts.timings);
-    let peaks_key = Cache::key(
+    let started = Instant::now();
+    let peaks_key = key(
         "peaks",
-        &[&video_sha, &brief.encoder, &brief_hash, &timings_hash],
+        &json!({"metrics":metrics_key,"embeddings":embedding_key,"brief":brief}),
     );
-    let mut candidates: Vec<Candidate> = match cache.get(&peaks_key) {
-        Some(c) => {
-            tick("peaks", s, true, String::new());
-            c
-        }
-        None => {
-            let c = pick_peaks(&p, emb.as_deref(), brief, &words);
-            cache.put(&peaks_key, &c)?;
-            tick("peaks", s, false, format!("{} candidates", c.len()));
-            c
-        }
-    };
-    // Zero-shot tags: top-4 labels at ≥0.25 cosine — fact-sheet fodder,
-    // never sent to Jev as vectors.
-    if !vocab_emb.is_empty()
-        && let Some(e) = &emb
-    {
-        tag_candidates(&mut candidates, e, &vocab_emb, &brief.tag_vocab, 4, 0.25);
+    let (mut candidates, hit): (Vec<Candidate>, _) = cached(&cache, &peaks_key, |_| {
+        Ok(pick_peaks(
+            &p,
+            embeddings.as_deref(),
+            brief,
+            &words_of(&opts.timings),
+        ))
+    })?;
+    if let Some(e) = &embeddings {
+        tag_candidates(&mut candidates, e, &vocab, &brief.tag_vocab, 4, 0.25);
     }
-
-    // ---- pack ----------------------------------------------------------------
-    let s = Instant::now();
-    let pack = score_pack(&candidates, &p, emb.as_deref(), brief);
+    log.record(
+        "peaks",
+        started,
+        hit,
+        format!("{} candidates", candidates.len()),
+    );
+    let started = Instant::now();
+    let pack = score_pack(&candidates, &p, embeddings.as_deref(), brief);
     write_json(opts.out, "metrics", &p)?;
     write_json(opts.out, "peaks", &candidates)?;
     write_json(opts.out, "pack", &pack)?;
-    tick("pack", s, false, String::new());
-
-    // ---- jev route -------------------------------------------------------------
-    let s = Instant::now();
-    let outcome = match opts.registry.filter(|r| r.get("jev").is_some()) {
-        Some(reg) => {
-            let key = Cache::key("jev_route", &[&hash_str(&pack.to_string()), &brief_hash]);
-            let out = match cache.get::<jev::RouteOutcome>(&key) {
-                Some(o) => {
-                    tick("jev_route", s, true, String::new());
-                    o
-                }
-                None => {
-                    // The connector writes its raw reply to the cache
-                    // path; overwrite it with the parsed outcome so a
-                    // cached hit deserializes into the same shape.
-                    let o = jev::route(reg, "jev", &pack, brief, &candidates, &cache.path(&key))?;
-                    cache.put(&key, &o)?;
-                    tick("jev_route", s, false, String::new());
-                    o
-                }
-            };
-            if !out.low_confidence.is_empty() {
-                warnings.push(format!(
-                    "jev low confidence on {} — not auto-exporting",
-                    out.low_confidence.join(",")
-                ));
-            }
-            out
-        }
-        None => {
-            let mut answers = std::collections::BTreeMap::new();
-            let mut o = jev::RouteOutcome::default();
-            for c in &candidates {
-                o.keeps.push(c.id.clone());
-                answers.insert(
-                    c.id.clone(),
-                    jev::RouteAnswer {
-                        route: jev::Route::Keep,
-                        cut_strength: 5,
-                        too_similar: 0.0,
-                        confidence: 1.0,
-                    },
-                );
-            }
-            o.answers = answers;
-            warnings.push("no jev capability — every candidate kept unrouted".into());
-            tick("jev_route", s, true, "offline".into());
-            o
+    log.record("pack", started, false, String::new());
+    let started = Instant::now();
+    let outcome = if let Some(reg) = opts.registry.filter(|r| r.get("jev").is_some()) {
+        let route_key = key(
+            "jev-route",
+            &json!({"request":jev::route_doc(&pack,brief),"brief":brief,
+            "connector":connector_identity(Some(reg),"jev")}),
+        );
+        let (outcome, hit) = cached(&cache, &route_key, |path| {
+            jev::route(reg, "jev", &pack, brief, &candidates, path)
+        })?;
+        log.record("jev_route", started, hit, String::new());
+        outcome
+    } else {
+        warnings.push("no jev capability — every candidate kept unrouted".into());
+        log.record("jev_route", started, true, "offline".into());
+        jev::RouteOutcome {
+            keeps: candidates.iter().map(|c| c.id.clone()).collect(),
+            ..Default::default()
         }
     };
-    let mut keep_refs: Vec<&Candidate> = candidates
+    let keeps: Vec<&Candidate> = candidates
         .iter()
         .filter(|c| outcome.keeps.contains(&c.id))
         .collect();
-    keep_refs.sort_by(|a, b| a.t.total_cmp(&b.t));
     write_json(opts.out, "keeps", &outcome.keeps)?;
-
-    // ---- gemini ------------------------------------------------------------------
-    let s = Instant::now();
-    let model_tag = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "unset".into());
-    let mut analysis: Option<GeminiAnalysis> = None;
-    if let Some(reg) = opts.registry.filter(|r| r.get(&brief.gemini_cap).is_some()) {
-        let gctx = GeminiCtx {
-            reg,
-            video: opts.input,
-            brief,
-            mode: opts.gemini_mode,
-            out: opts.out,
-            cache: &cache,
-            model_tag: &model_tag,
-        };
-        if keep_refs.is_empty() {
-            warnings.push("no keeps — gemini skipped".into());
-        } else {
-            // Forced single-window retry: `--rerun-window f371`.
-            if let Some(id) = &opts.rerun_window {
-                let keep = keep_refs
-                    .iter()
-                    .copied()
-                    .find(|k| &k.id == id)
-                    .ok_or_else(|| {
-                        MemeError::Stage(format!("rerun window `{id}` is not a keep"))
-                    })?;
-                let (a, hit) = gctx.one(keep)?;
-                tick("gemini", s, hit, format!("rerun {id}"));
-                analysis = Some(a);
-            } else {
-                let ids: Vec<String> = keep_refs.iter().map(|k| k.id.clone()).collect();
-                let keeps_hash = hash_str(&ids.join(","));
-                let key = Cache::key(
-                    "gemini",
-                    &[
-                        &keeps_hash,
-                        &brief_hash,
-                        &model_tag,
-                        opts.gemini_mode_label(),
-                    ],
-                );
-                match cache.get::<GeminiAnalysis>(&key) {
-                    Some(a) => {
-                        tick("gemini", s, true, String::new());
-                        analysis = Some(a);
-                    }
-                    None => {
-                        let files =
-                            materialize(opts.gemini_mode, opts.input, &keep_refs, opts.out, brief)?;
-                        let a = gemini::analyze(
-                            reg,
-                            "gemini",
-                            brief,
-                            opts.gemini_mode,
-                            &files,
-                            &cache.path(&key),
-                        )?;
-                        cache.put(&key, &a)?;
-                        tick(
-                            "gemini",
-                            s,
-                            false,
-                            format!("{} {}", files.len(), opts.gemini_mode_label()),
-                        );
-                        analysis = Some(a);
-                    }
-                }
-            }
-            if let Some(a) = &analysis {
-                write_json(opts.out, "gemini", a)?;
-            }
-        }
-    } else {
-        tick("gemini", s, true, "offline".into());
-    }
-
-    // ---- jev package --------------------------------------------------------------
-    let s = Instant::now();
-    let mut decision = match (opts.registry.filter(|r| r.get("jev").is_some()), &analysis) {
-        (Some(reg), Some(a)) => {
-            let key = Cache::key(
-                "jev_package",
-                &[
-                    &hash_str(&serde_json::to_string(a).unwrap_or_default()),
-                    &brief_hash,
-                ],
-            );
-            match cache.get::<PackageOutcome>(&key) {
-                Some(d) => {
-                    tick("jev_package", s, true, String::new());
-                    d
-                }
-                None => {
-                    let d = package::package(reg, "jev", brief, &keep_refs, a, &cache.path(&key))?;
-                    cache.put(&key, &d)?;
-                    tick("jev_package", s, false, String::new());
-                    d
-                }
-            }
-        }
+    let ctx = gemini_reg.map(|reg| GeminiCtx {
+        reg,
+        video: opts.input,
+        video_sha: &video_sha,
+        brief,
+        mode: opts.gemini_mode,
+        out: opts.out,
+        cache: &cache,
+    });
+    let mut analysis = match &ctx {
+        Some(ctx) if !keeps.is_empty() => Some(ctx.analyze(&keeps, false, &mut log)?),
         _ => {
-            let d = package::fallback_package(&keep_refs);
-            tick("jev_package", s, true, "offline".into());
-            d
+            log.record("gemini", Instant::now(), true, "offline or no keeps".into());
+            None
         }
     };
-
-    // Bounded rerun_window loop — re-analyze only the named keep's window.
+    if let Some(id) = &opts.rerun_window {
+        let ctx = ctx
+            .as_ref()
+            .ok_or_else(|| MemeError::Stage("rerun-window requires Gemini".into()))?;
+        let keep = keeps
+            .iter()
+            .copied()
+            .find(|k| &k.id == id)
+            .ok_or_else(|| MemeError::Stage(format!("rerun window `{id}` is not a keep")))?;
+        let update = ctx.analyze(&[keep], true, &mut log)?;
+        analysis
+            .get_or_insert_with(Default::default)
+            .merge_window(id, update);
+    }
+    let decide = |analysis: &Option<GeminiAnalysis>,
+                  log: &mut Recorder<'_>|
+     -> Result<PackageOutcome, MemeError> {
+        let started = Instant::now();
+        if let (Some(reg), Some(a)) = (opts.registry.filter(|r| r.get("jev").is_some()), analysis) {
+            let package_key = key(
+                "jev-package",
+                &json!({"request":package::package_doc(brief,&keeps,a),"brief":brief,
+                "connector":connector_identity(Some(reg),"jev")}),
+            );
+            let (decision, hit) = cached(&cache, &package_key, |path| {
+                package::package(reg, "jev", brief, &keeps, a, path)
+            })?;
+            log.record("jev_package", started, hit, String::new());
+            Ok(decision)
+        } else {
+            log.record("jev_package", started, true, "offline".into());
+            Ok(package::fallback_package(&keeps))
+        }
+    };
+    let mut decision = decide(&analysis, &mut log)?;
     for _ in 0..MAX_RERUNS {
         let Package::RerunWindow { keep_id } = &decision.package else {
             break;
         };
-        let Some(reg) = opts.registry.filter(|r| r.get(&brief.gemini_cap).is_some()) else {
-            warnings.push("rerun_window requested but no gemini capability".into());
-            break;
+        let Some(ctx) = &ctx else { break };
+        let Some(keep) = keeps.iter().copied().find(|k| &k.id == keep_id) else {
+            return Err(MemeError::Stage(format!(
+                "rerun_window named unknown keep `{keep_id}`"
+            )));
         };
-        let Some(keep) = keep_refs.iter().copied().find(|k| &k.id == keep_id) else {
-            warnings.push(format!("rerun_window named unknown keep `{keep_id}`"));
-            break;
-        };
-        let gctx = GeminiCtx {
-            reg,
-            video: opts.input,
-            brief,
-            mode: opts.gemini_mode,
-            out: opts.out,
-            cache: &cache,
-            model_tag: &model_tag,
-        };
-        let s = Instant::now();
-        let (a, hit) = gctx.one(keep)?;
-        tick("gemini_rerun", s, hit, keep_id.clone());
-        analysis = Some(a.clone());
-        write_json(opts.out, "gemini", &a)?;
-        // Re-package against the fresh window analysis.
-        if let Some(reg) = opts.registry.filter(|r| r.get("jev").is_some()) {
-            let key = Cache::key(
-                "jev_package",
-                &[
-                    &hash_str(&serde_json::to_string(&a).unwrap_or_default()),
-                    &brief_hash,
-                ],
-            );
-            decision = package::package(reg, "jev", brief, &keep_refs, &a, &cache.path(&key))?;
-            cache.put(&key, &decision)?;
-        } else {
-            decision = package::fallback_package(&keep_refs);
-        }
+        let update = ctx.analyze(&[keep], true, &mut log)?;
+        analysis
+            .get_or_insert_with(Default::default)
+            .merge_window(keep_id, update);
+        decision = decide(&analysis, &mut log)?;
     }
-
-    // Low-confidence route answers never auto-export.
     if !outcome.low_confidence.is_empty() && decision.package == Package::Export {
-        decision = PackageOutcome {
-            package: Package::NeedMorePeaks,
-            note: "low-confidence route answers — needs a human".into(),
-            ..decision
-        };
+        decision.package = Package::NeedMorePeaks;
+        decision.note = "low-confidence routing needs human review".into();
+    }
+    if let Some(a) = &analysis {
+        write_json(opts.out, "gemini", a)?;
     }
     write_json(opts.out, "package", &decision)?;
-
-    // ---- emit ----------------------------------------------------------------------
-    let s = Instant::now();
+    let started = Instant::now();
     let scene_path = opts.out.join("meme.scene");
-    let mut spans = beat_spans(&keep_refs, opts.beat_sec, info.duration_s);
+    let mut spans = beat_spans(&keeps, opts.beat_sec, info.duration_s);
     let scene_src = if opts.materialize {
-        materialize_beats(opts.input, &mut spans, &opts.out.join("beats"))?;
-        String::new() // beats carry their own srcs
+        let beat_key = key("beats", &json!({"video":video_sha,"spans":spans}));
+        let relative = Path::new("beats").join(beat_key);
+        materialize_beats(opts.input, &mut spans, &opts.out.join(&relative))?;
+        for span in &mut spans {
+            if let Some(file) = &span.file {
+                span.file = Some(relative.join(file.file_name().expect("beat filename")));
+            }
+        }
+        String::new()
     } else {
         place_source(opts.input, opts.out)?
     };
-    let (n, d) = info
-        .video
+    let music_src = opts
+        .music_src
         .as_ref()
-        .and_then(|v| v.frame_rate)
-        .map(|r| (u64::from(r.numerator), u64::from(r.denominator)))
-        .unwrap_or((30, 1));
+        .map(|path| place_source(Path::new(path), opts.out))
+        .transpose()?;
+    let video = info.video.as_ref().expect("validated video");
+    let rate = video
+        .frame_rate
+        .map(|r| (u64::from(r.numerator), u64::from(r.denominator)));
     let spec = EmitSpec {
         src: &scene_src,
-        canvas: info
-            .video
-            .as_ref()
-            .map(|v| (v.width, v.height))
-            .unwrap_or((1080, 1920)),
-        fps: Some((n, d)),
+        canvas: (video.width, video.height),
+        fps: rate,
         has_audio: info.audio.is_some(),
-        music_src: opts.music_src.as_deref(),
+        music_src: music_src.as_deref(),
         render_target: "meme.mp4",
     };
-    let markup = emit_flash_scene(&spans, &spec);
-    write_atomic(&scene_path, markup.as_bytes())?;
-    tick("emit", s, false, format!("{} beats", spans.len()));
-
-    Ok(RunReport {
+    // Empty detections remain an explicit need-more-peaks report, not a false export.
+    if spans.is_empty() {
+        decision.package = Package::NeedMorePeaks;
+        write_json(opts.out, "package", &decision)?;
+    }
+    write_atomic(&scene_path, emit_flash_scene(&spans, &spec).as_bytes())?;
+    log.record("emit", started, false, format!("{} beats", spans.len()));
+    let report = RunReport {
         video_sha256: video_sha,
         frames_seen: p.frames.len(),
         candidates: candidates.len(),
-        keeps: outcome.keeps.clone(),
-        low_confidence: outcome.low_confidence.clone(),
+        keeps: outcome.keeps,
+        low_confidence: outcome.low_confidence,
         decision,
         gemini: analysis,
         scene: scene_path,
         warnings,
-        stages,
-    })
-}
-
-impl RunOpts<'_> {
-    /// Short label for logging/cache keys.
-    fn gemini_mode_label(&self) -> &'static str {
-        match self.gemini_mode {
-            GeminiMode::Stills => "stills",
-            GeminiMode::Windows => "windows",
-        }
-    }
+        stages: log.stages,
+    };
+    write_json(opts.out, "report", &report)?;
+    Ok(report)
 }

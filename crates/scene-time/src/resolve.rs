@@ -85,10 +85,10 @@ impl<'a> Resolver<'a> {
         }
         let idx = if n > 0.0 {
             let i = b.partition_point(|x| *x <= pos + EPS);
-            (i + n as usize).saturating_sub(1)
+            i.saturating_add(n as usize).saturating_sub(1)
         } else {
             let i = b.partition_point(|x| *x < pos - EPS);
-            (i as i64 + n as i64).max(0) as usize
+            (i as i64).saturating_add(n as i64).max(0) as usize
         };
         b[idx.min(b.len() - 1)]
     }
@@ -237,5 +237,21 @@ fn resolve_element(
             .map(|c| resolve_element(c, (start_s, end_s), resolver, fps))
             .collect(),
         span: element.span,
+    }
+}
+
+#[cfg(test)]
+mod large_offsets {
+    use super::*;
+    #[test]
+    fn word_offsets_saturate_before_indexing() {
+        let source = TimingSource::default();
+        let resolver = Resolver {
+            boundaries: vec![0.0, 1.0, 2.0],
+            fps: 30.0,
+            source: &source,
+        };
+        assert_eq!(resolver.shift_words(1.0, 18446744073709551616.0), 2.0);
+        assert_eq!(resolver.shift_words(1.0, -18446744073709551616.0), 0.0);
     }
 }

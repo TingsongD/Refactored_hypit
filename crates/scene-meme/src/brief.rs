@@ -31,7 +31,7 @@ pub const DEFAULT_TAG_VOCAB: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Brief {
     /// Job discriminator — the pipeline only does one thing, but the
     /// field rides into Jev state so a shared endpoint sees intent.
@@ -62,11 +62,16 @@ pub struct Brief {
     /// Sharpness floor — below it a frame is transition smear.
     pub min_sharpness: f64,
     /// Mean-luma bounds — outside these a frame is near-black/white.
+    #[serde(alias = "brightness_lo")]
     pub brightness_min: f64,
+    #[serde(alias = "brightness_hi")]
     pub brightness_max: f64,
     /// Audio-onset contribution to `importance` — raises beats that
     /// cut on sound even when the visual change is modest.
     pub onset_weight: f64,
+    pub onset_keep: f64,
+    pub snap_to_onset: bool,
+    pub snap_to_sharp: bool,
     /// Snap radius (frames) when aligning a keep to an onset or word
     /// boundary. ±3 ≈ 100 ms at 30 fps.
     pub snap_radius_frames: u32,
@@ -81,6 +86,11 @@ pub struct Brief {
     // --- Gemini ----------------------------------------------------------
     /// Capability name — resolves in scene.toml, not a hardcoded model.
     pub gemini_cap: String,
+    pub gemini_model: Option<String>,
+    pub jev_model: Option<String>,
+    pub input_price_per_million: Option<f64>,
+    pub output_price_per_million: Option<f64>,
+    pub max_output_tokens: u32,
     /// Half-window around each keep for `windows` mode.
     pub gemini_window_sec: f64,
     /// Sampling rate for window transcodes — default Gemini sampling
@@ -91,6 +101,8 @@ pub struct Brief {
     /// `"dhash"` (built-in, offline) or an `embed` capability name whose
     /// connector returns frame embeddings (e.g. MobileCLIP).
     pub encoder: String,
+    pub embedding_model: Option<String>,
+    pub weights_id: Option<String>,
     /// Zero-shot vocabulary for candidate tagging (embed mode only).
     pub tag_vocab: Vec<String>,
 }
@@ -112,13 +124,23 @@ impl Default for Brief {
             brightness_min: 0.05,
             brightness_max: 0.95,
             onset_weight: 0.4,
+            onset_keep: 0.4,
+            snap_to_onset: true,
+            snap_to_sharp: true,
             snap_radius_frames: 3,
             max_candidates_to_jev: 60,
             jev_min_confidence: 0.55,
             gemini_cap: "gemini".into(),
+            gemini_model: None,
+            jev_model: None,
+            input_price_per_million: None,
+            output_price_per_million: None,
+            max_output_tokens: 4096,
             gemini_window_sec: 0.6,
             gemini_fps: 10.0,
             encoder: "dhash".into(),
+            embedding_model: None,
+            weights_id: None,
             tag_vocab: DEFAULT_TAG_VOCAB.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -162,6 +184,7 @@ impl Brief {
             ("brightness_min", self.brightness_min),
             ("brightness_max", self.brightness_max),
             ("onset_weight", self.onset_weight),
+            ("onset_keep", self.onset_keep),
             ("jev_min_confidence", self.jev_min_confidence),
         ] {
             if !(0.0..=1.0).contains(&v) {
@@ -177,13 +200,62 @@ impl Brief {
         if self.max_candidates_to_jev == 0 {
             return bad("max_candidates_to_jev must be >= 1");
         }
-        if self.gemini_window_sec <= 0.0 || self.gemini_fps <= 0.0 {
+        if !self.gemini_window_sec.is_finite()
+            || !self.gemini_fps.is_finite()
+            || self.gemini_window_sec <= 0.0
+            || !(1.0..=120.0).contains(&self.gemini_fps)
+        {
             return bad("gemini_window_sec and gemini_fps must be positive");
+        }
+        if self.max_output_tokens == 0 {
+            return bad("max_output_tokens must be positive");
+        }
+        for price in [self.input_price_per_million, self.output_price_per_million]
+            .into_iter()
+            .flatten()
+        {
+            if !price.is_finite() || price < 0.0 {
+                return bad("token prices must be finite and nonnegative");
+            }
+        }
+        for value in [
+            &self.gemini_model,
+            &self.jev_model,
+            &self.embedding_model,
+            &self.weights_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.trim().is_empty() {
+                return bad("model and weights settings must not be empty");
+            }
         }
         if self.encoder.is_empty() {
             return bad("encoder must be non-empty (`dhash` or a capability name)");
         }
         Ok(())
+    }
+
+    /// Freeze environment settings once; requests and cache keys share these values.
+    pub fn effective(&self) -> Result<Self, MemeError> {
+        let mut out = self.clone();
+        out.gemini_model = out
+            .gemini_model
+            .or_else(|| std::env::var("GEMINI_MODEL").ok());
+        out.jev_model = out.jev_model.or_else(|| std::env::var("JEV_MODEL").ok());
+        out.embedding_model = Some(
+            out.embedding_model
+                .or_else(|| std::env::var("OPEN_CLIP_MODEL").ok())
+                .unwrap_or_else(|| "MobileCLIP2-S0".into()),
+        );
+        out.weights_id = Some(
+            out.weights_id
+                .or_else(|| std::env::var("OPEN_CLIP_PRETRAINED").ok())
+                .unwrap_or_else(|| "dfndr2b".into()),
+        );
+        out.validate()?;
+        Ok(out)
     }
 
     /// sha256 over the canonical serialization — struct field order is

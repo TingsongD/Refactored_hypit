@@ -58,6 +58,7 @@ fn one() -> f64 {
 pub fn package_doc(brief: &Brief, keeps: &[&Candidate], analysis: &GeminiAnalysis) -> Value {
     json!({
         "task": "jev_package",
+        "model": brief.jev_model,
         "brief": {
             "job": brief.job,
             "description": brief.description,
@@ -152,6 +153,7 @@ mod tests {
             id: format!("f{i}"),
             frame: i,
             t: i as f64 / 30.0,
+            representative_t: i as f64 / 30.0,
             change: 0.5,
             sharpness: 0.9,
             motion: 0.5,

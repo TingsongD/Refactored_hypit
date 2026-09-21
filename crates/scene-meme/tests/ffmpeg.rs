@@ -17,6 +17,7 @@ fn keep(i: u64) -> Candidate {
         id: format!("f{i}"),
         frame: i,
         t: i as f64 / 30.0,
+        representative_t: i as f64 / 30.0,
         change: 0.5,
         sharpness: 0.9,
         motion: 0.5,
@@ -207,4 +208,97 @@ fn materialize_beats_cuts_real_clips_with_audio() {
         assert!(info.duration_s > 0.2 && info.duration_s < 0.8);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn custom_connector_preflight_usage_and_cache_invalidation() {
+    if !gated() || !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    use scene_meme::run::{RunOpts, run_with_progress};
+    let dir = tempdir("mock-provider");
+    let clip = make_av_clip(&dir);
+    let script = dir.join("mock.py");
+    let marker = dir.join("preflight");
+    std::fs::write(&script, format!(r#"
+import json,sys,pathlib
+req=json.load(sys.stdin)
+assert pathlib.Path({marker:?}).exists(), 'preflight must arrive before provider execution'
+p=req['params']
+assert p['model']=='offline-model'
+assert all('representative_t' in k and 'word' in k and 'onset' in k for k in p['keeps'])
+pathlib.Path(req['out']).write_text(json.dumps({{'beats':[{{'id':k['id'],'t':k['t']}} for k in p['keeps']], 'usage':{{'input_tokens':100,'output_tokens':20}}}}))
+"#, marker=marker.to_string_lossy())).unwrap();
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let config = format!(
+        "[capabilities.custom]\ncommand = [{}, {}]\n",
+        serde_json::to_string(python).unwrap(),
+        serde_json::to_string(&script).unwrap()
+    );
+    let registry = scene_cap::Registry::from_toml(&config).unwrap();
+    let mut brief = Brief {
+        gemini_cap: "custom".into(),
+        gemini_model: Some("offline-model".into()),
+        change_keep: 0.000001,
+        change_skip: 0.0,
+        min_sharpness: 0.0,
+        dup_cosine: 1.0,
+        snap_to_sharp: false,
+        max_candidates_to_jev: 2,
+        input_price_per_million: Some(1.0),
+        output_price_per_million: Some(2.0),
+        ..Brief::default()
+    };
+    let out = dir.join("out");
+    let execute = |brief: &Brief| {
+        let mut phases = Vec::new();
+        let result = run_with_progress(
+            &RunOpts {
+                input: &clip,
+                brief,
+                out: &out,
+                timings: TimingMap::default(),
+                registry: Some(&registry),
+                beat_sec: 0.2,
+                materialize: false,
+                gemini_mode: scene_meme::gemini::GeminiMode::Stills,
+                rerun_window: None,
+                music_src: None,
+            },
+            &mut |event| {
+                if event.phase == "preflight" {
+                    std::fs::write(&marker, b"ready").unwrap();
+                }
+                phases.push((event.stage, event.phase, event.cache_hit));
+            },
+        )
+        .unwrap();
+        (result, phases)
+    };
+    let (first, phases) = execute(&brief);
+    assert!(first.keeps.len() >= 2);
+    let events: Vec<_> = phases.iter().filter(|e| e.0 == "gemini").collect();
+    assert_eq!(events[0].1, "preflight");
+    assert_eq!(events[1].1, "complete");
+    let usage = first
+        .stages
+        .iter()
+        .find(|e| e.stage == "gemini" && e.phase == "complete")
+        .unwrap();
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(20));
+    assert!((usage.estimated_cost_usd.unwrap() - 0.00014).abs() < 1e-9);
+    let (_, phases) = execute(&brief);
+    assert!(phases.iter().any(|e| e.0 == "gemini" && e.2));
+    brief.gemini_fps = 12.0;
+    let (_, phases) = execute(&brief);
+    assert!(phases.iter().any(|e| e.1 == "preflight"));
+    std::fs::write(
+        &script,
+        std::fs::read_to_string(&script).unwrap() + "\n# changed adapter\n",
+    )
+    .unwrap();
+    let (_, phases) = execute(&brief);
+    assert!(phases.iter().any(|e| e.1 == "preflight"));
+    let _ = std::fs::remove_dir_all(dir);
 }

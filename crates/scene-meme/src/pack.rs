@@ -7,7 +7,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::brief::Brief;
-use crate::embed::cosine;
 use crate::peaks::{Candidate, PeakSource};
 use crate::perceive::Perceive;
 
@@ -50,17 +49,7 @@ pub struct FactRow {
 /// Signature similarity between two candidate frames — cosine under an
 /// encoder, dHash hamming/64 offline. Local to this call.
 fn sim(p: &Perceive, emb: Option<&[Vec<f32>]>, a: &Candidate, b: &Candidate) -> f64 {
-    if let Some(emb) = emb
-        && let (Some(x), Some(y)) = (emb.get(a.frame as usize), emb.get(b.frame as usize))
-    {
-        return (cosine(x, y) * 0.5 + 0.5).clamp(0.0, 1.0);
-    }
-    // Same dual-signature rule as peaks::similarity — structure AND
-    // level must both match for "same beat".
-    let (fa, fb) = (&p.frames[a.frame as usize], &p.frames[b.frame as usize]);
-    let struct_dist = (fa.dhash ^ fb.dhash).count_ones() as f64 / 64.0;
-    let level_dist = (4.0 * (fa.brightness - fb.brightness).abs()).min(1.0);
-    1.0 - struct_dist.max(level_dist)
+    crate::peaks::similarity(p, emb, a.frame, b.frame)
 }
 
 /// Build the fact sheet. Caps at `brief.max_candidates_to_jev` by
@@ -93,7 +82,7 @@ pub fn score_pack(
                 .max_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(id, s)| (Some(id), s))
                 .unwrap_or((None, 0.0));
-            let hop = p.audio.get(c.frame as usize);
+            let hop = p.audio.get((c.t * p.fps).round() as usize);
             FactRow {
                 id: c.id.clone(),
                 t: c.t,
@@ -134,6 +123,7 @@ mod tests {
             id: format!("f{i}"),
             frame: i,
             t: i as f64 / 30.0,
+            representative_t: i as f64 / 30.0,
             change: 0.5,
             sharpness: 0.9,
             motion: 0.5,

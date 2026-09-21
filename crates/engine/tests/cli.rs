@@ -137,6 +137,90 @@ fn meme_offline_run_emits_a_valid_scene() {
     for name in ["metrics", "peaks", "pack", "keeps", "package"] {
         assert!(out.join(format!("{name}.json")).exists(), "{name}.json");
     }
+    let original = std::fs::read_to_string(&scene).unwrap();
+    let source_hash = scene_meme::cache::Cache::file_sha256(&clip).unwrap();
+    assert!(original.contains(&format!("assets/{source_hash}.mp4")));
+    let silent = dir.join("silent.mp4");
+    assert!(
+        std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-i"])
+            .arg(&clip)
+            .args(["-an", "-vf", "hue=h=90"])
+            .arg(&silent)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for materialize in [false, true] {
+        let mut command = Command::cargo_bin("engine").unwrap();
+        command
+            .args(["meme"])
+            .arg(&silent)
+            .arg("--out")
+            .arg(&out)
+            .arg("--music")
+            .arg(&clip)
+            .arg("--config")
+            .arg(dir.join("no-such.toml"));
+        if materialize {
+            command.arg("--materialize");
+        }
+        command.assert().success();
+        let generated = std::fs::read_to_string(&scene).unwrap();
+        assert!(
+            generated.contains("<music"),
+            "silent source retains music bed"
+        );
+        assert!(generated.contains(&format!("assets/{source_hash}.mp4")));
+        assert!(
+            !generated.contains(out.to_str().unwrap()),
+            "references are scene-relative"
+        );
+        if materialize {
+            assert!(generated.contains("src=\"beats/"));
+        } else {
+            let changed_hash = scene_meme::cache::Cache::file_sha256(&silent).unwrap();
+            assert!(generated.contains(&format!("assets/{changed_hash}.mp4")));
+            assert_ne!(original, generated);
+        }
+        let rendered = out.join("verified.mp4");
+        Command::cargo_bin("engine")
+            .unwrap()
+            .arg("render")
+            .arg(&scene)
+            .arg("--out")
+            .arg(&rendered)
+            .assert()
+            .success();
+        let info = scene_media::probe(&rendered).unwrap();
+        assert!(info.audio.is_some());
+        let frame = scene_media::FrameStream::open(&rendered)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            frame
+                .pixels
+                .chunks_exact(4)
+                .any(|p| p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() > 30),
+            "real colored pixels"
+        );
+    }
+    for width in ["0", "NaN", "inf"] {
+        Command::cargo_bin("engine")
+            .unwrap()
+            .arg("meme")
+            .arg(&clip)
+            .arg("--out")
+            .arg(&out)
+            .arg("--beat-sec")
+            .arg(width)
+            .arg("--config")
+            .arg(dir.join("no-such.toml"))
+            .assert()
+            .failure();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

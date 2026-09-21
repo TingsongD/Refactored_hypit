@@ -196,3 +196,50 @@ impl Drop for PcmStream {
         let _ = self.child.wait();
     }
 }
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[test]
+    fn pcm_blocked_read_is_guarded_but_idle_stream_is_not() {
+        let mut child = spawn_grouped(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proc::tests::pipe_holder_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = StderrDrain::start(child.stderr.take().unwrap());
+        let heartbeat = heartbeat();
+        let watchdog = StallWatchdog::arm(child.id(), heartbeat.clone(), Duration::from_millis(80));
+        let mut stream = PcmStream {
+            child,
+            stdout,
+            stderr,
+            heartbeat,
+            watchdog,
+            chunk_len: 4096,
+            hop_samples: 1024,
+            index: 0,
+        };
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(
+            stream.child.try_wait().unwrap().is_none(),
+            "idle PCM child was killed"
+        );
+        let start = std::time::Instant::now();
+        let _ = stream.next();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "PCM read did not meet deadline"
+        );
+        assert!(stream.child.try_wait().unwrap().is_some());
+    }
+}
