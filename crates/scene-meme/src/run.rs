@@ -341,6 +341,17 @@ pub fn run_with_progress(
             "meme requires a video with a positive finite duration".into(),
         ));
     }
+    let output_fps = info
+        .video
+        .as_ref()
+        .and_then(|v| v.frame_rate.as_ref())
+        .map(|r| r.numerator as f64 / r.denominator as f64)
+        .unwrap_or(30.0);
+    if opts.beat_sec.min(info.duration_s) * output_fps < 1.0 - 1e-9 {
+        return Err(MemeError::Brief(
+            "beat-sec must cover at least one output frame".into(),
+        ));
+    }
     let video_sha = Cache::file_sha256(opts.input)?;
     log.record("probe", started, false, String::new());
     let started = Instant::now();

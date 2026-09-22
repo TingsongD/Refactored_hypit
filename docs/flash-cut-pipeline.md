@@ -420,3 +420,6 @@ beats and offset-based beats use the same clamped source windows.
 Generated files use private staging and atomic publication. A failed individual
 publication preserves its previous destination. This is per-file atomicity, not a
 transaction spanning every report and media file in a run.
+
+Beat durations must cover at least one output frame. Smaller positive widths are
+rejected after probing, before perception or provider execution, to prevent zero-frame exports.

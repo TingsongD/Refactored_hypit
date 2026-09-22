@@ -1152,32 +1152,23 @@ mod tests {
     #[test]
     fn adapt_src_resolves_against_the_cwd_for_stdout() {
         let cwd = std::env::current_dir().unwrap();
-        // Same-dir case: source beside the scene stays a bare name.
-        assert_eq!(
-            adapt_src(Path::new("assets/v.mp4"), Path::new("assets")),
-            "v.mp4"
-        );
-        // A nested --out climbs back: `adapt source.mp4 --out
-        // nested/draft.scene` must emit `../source.mp4`, not a path that
-        // only resolves from the cwd.
-        assert_eq!(
-            adapt_src(Path::new("source.mp4"), Path::new("nested")),
-            Path::new("..").join("source.mp4").display().to_string()
-        );
-        // Sibling trees climb then descend.
-        assert_eq!(
-            adapt_src(Path::new("assets/v.mp4"), Path::new("nested/deep")),
-            "../../assets/v.mp4"
-        );
-        // Outside the project tree → absolute, which resolves anywhere.
-        let outside = Path::new("/definitely/not/here.mp4");
-        assert_eq!(
-            adapt_src(outside, Path::new(".")),
-            "/definitely/not/here.mp4"
-        );
-        // Absolute source inside the project still relativizes.
+        for (source, root, expected) in [
+            ("assets/v.mp4", "assets", "v.mp4"),
+            ("source.mp4", "nested", "../source.mp4"),
+            ("assets/v.mp4", "nested/deep", "../../assets/v.mp4"),
+        ] {
+            assert_eq!(
+                PathBuf::from(adapt_src(Path::new(source), Path::new(root))),
+                Path::new(expected)
+            );
+        }
+        let outside = std::path::absolute("/definitely/not/here.mp4").unwrap();
+        assert_eq!(PathBuf::from(adapt_src(&outside, Path::new("."))), outside);
         let under = cwd.join("assets").join("v.mp4");
-        assert_eq!(adapt_src(&under, Path::new(".")), "assets/v.mp4");
+        assert_eq!(
+            PathBuf::from(adapt_src(&under, Path::new("."))),
+            Path::new("assets/v.mp4")
+        );
     }
 
     /// The review repro: `adapt clip.mp4 --out nested/draft.scene` used

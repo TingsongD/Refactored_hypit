@@ -472,3 +472,12 @@ The first branch CI run found Rust 1.98's new constant-chunk Clippy lint (local
 initial checks used 1.94). PCM, metric and pixel-test iteration now uses typed
 array chunks; the lint is fixed rather than suppressed. The CI-matching 1.98
 toolchain is also used for local follow-up validation.
+
+A final complete-example audit corrected the adapt playbook's literal ellipsis
+and outdated path explanation; its scene now passes validation. A tiny positive
+beat-width smoke test exposed a zero-frame export: widths shorter than one output
+frame now fail after probing, before perception or any provider call.
+
+The second CI run passed Linux/macOS and exposed remaining slash-literal
+assertions in the Windows adapt-path test. The entire test now compares native
+Path values, including the absolute-source case, instead of platform strings.

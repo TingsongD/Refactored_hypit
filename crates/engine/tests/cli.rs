@@ -177,7 +177,13 @@ fn meme_offline_run_emits_a_valid_scene() {
             "references are scene-relative"
         );
         if materialize {
-            assert!(generated.contains("src=\"beats/"));
+            assert!(
+                generated
+                    .split("src=\"")
+                    .skip(1)
+                    .filter_map(|part| part.split('"').next())
+                    .any(|src| std::path::Path::new(src).starts_with("beats"))
+            );
         } else {
             let changed_hash = scene_meme::cache::Cache::file_sha256(&silent).unwrap();
             assert!(generated.contains(&format!("assets/{changed_hash}.mp4")));
@@ -209,7 +215,7 @@ fn meme_offline_run_emits_a_valid_scene() {
             "real colored pixels"
         );
     }
-    for width in ["0", "NaN", "inf"] {
+    for width in ["0", "NaN", "inf", "0.000000001"] {
         Command::cargo_bin("engine")
             .unwrap()
             .arg("meme")

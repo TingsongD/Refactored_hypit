@@ -13,8 +13,8 @@ engine adapt "https://example.com/talk" --out-dir assets --out main.scene
 ```
 
 URLs route through `yt-dlp` (needs it installed — `engine doctor`
-checks). Local paths pass straight through; the `src` written into the
-scene is relative to `--out-dir` when the file lives inside it.
+checks). The emitted `src` is relative to the draft scene directory.
+Footage outside that directory is imported into its `assets/` directory.
 
 ## 2. Read what it found
 
@@ -36,7 +36,7 @@ The emitted draft:
     <board during="12.500s..31.250s" at="bottom" anim="rise">
       <text>Shot 2</text>
     </board>
-    …
+    <!-- Add the remaining shot boards here. -->
   </track>
   <track kind="audio">
     <music src="assets/lecture.mp4" during="0s..94.200s"/>
@@ -61,8 +61,8 @@ The `Shot N` placeholders are where your content goes:
 
 ## What to check
 
-- `engine check main.scene` — the emitter always produces valid markup;
-  if check fails, it's something *you* edited.
+- `engine check main.scene` — validate the generated draft and inspect any
+  diagnostics before rendering.
 - Single-shot footage emits **one** board covering the whole duration —
   the emitter always writes at least a `Shot 1` placeholder.
 - `adapt` never stores word timing; literal `Ns..Ms` anchors are what
