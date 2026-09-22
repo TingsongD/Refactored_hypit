@@ -242,6 +242,14 @@ mod deadline_tests {
             start.elapsed() < Duration::from_secs(5),
             "PCM read did not meet deadline"
         );
-        assert!(stream.child.try_wait().unwrap().is_some());
+        // Windows can close the killed process's pipes before its exit status
+        // becomes observable. Require termination within the same deadline.
+        while stream.child.try_wait().unwrap().is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "PCM child survived deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

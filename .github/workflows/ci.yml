@@ -31,7 +31,20 @@ jobs:
 
       - name: Install FFmpeg (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg --no-progress -y
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install ffmpeg --no-progress -y
+            if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+              ffmpeg -version
+              if ($LASTEXITCODE -ne 0) { throw "FFmpeg is not executable" }
+              ffprobe -version
+              if ($LASTEXITCODE -ne 0) { throw "FFprobe is not executable" }
+              exit 0
+            }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+          }
+          throw "Chocolatey did not install usable FFmpeg and FFprobe executables"
 
       - uses: actions/setup-python@v5
         with:

@@ -75,7 +75,7 @@ impl Lower {
         // confinement) — flag the same shapes at check time.
         let path = std::path::Path::new(&attr.value);
         if !attr.value.contains("://")
-            && (path.is_absolute()
+            && (path.has_root()
                 || path
                     .components()
                     .any(|c| matches!(c, std::path::Component::ParentDir)))
@@ -468,7 +468,7 @@ impl Lower {
         // The output side gets the same advisory `src` does — render
         // refuses an escaping target outright, so flag it at check time.
         let path = std::path::Path::new(&attr.value);
-        if path.is_absolute()
+        if path.has_root()
             || path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))

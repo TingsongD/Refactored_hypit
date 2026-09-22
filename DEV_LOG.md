@@ -492,3 +492,11 @@ After that correction, the Rust 1.98 FFmpeg-enabled workspace suite reports
 333 passed, 0 failed, four subprocess fixtures ignored by direct invocation.
 CI now collects all crate failures and runs the media suite after a test failure
 as well, so later platform defects are visible in the same run.
+
+### Additional Windows CI findings
+
+- Markup advisories recognize rooted paths without drive prefixes on Windows.
+- PCM deadline tests allow pipe EOF to precede observable process exit, while
+  retaining the five-second termination bound.
+- Windows FFmpeg installation retries transient package-feed failures and checks
+  both executables explicitly; Chocolatey can return success after a failed fetch.
