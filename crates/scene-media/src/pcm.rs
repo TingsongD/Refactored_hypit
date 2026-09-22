@@ -134,7 +134,9 @@ impl Iterator for PcmStream {
         match self.fill(&mut bytes) {
             Ok(n) if n == self.chunk_len => {
                 let samples: Vec<f32> = bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();
                 let chunk = PcmChunk {
@@ -167,7 +169,9 @@ impl Iterator for PcmStream {
                     *b = 0;
                 }
                 let samples: Vec<f32> = bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();
                 debug_assert_eq!(samples.len(), self.hop_samples);

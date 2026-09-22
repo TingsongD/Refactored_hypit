@@ -202,7 +202,9 @@ fn meme_offline_run_emits_a_valid_scene() {
         assert!(
             frame
                 .pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() > 30),
             "real colored pixels"
         );

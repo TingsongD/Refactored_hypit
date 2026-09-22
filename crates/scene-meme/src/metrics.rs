@@ -85,7 +85,9 @@ impl AudioHop {
 pub fn luma(frame: &Frame) -> Vec<u8> {
     frame
         .pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| ((299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000) as u8)
         .collect()
 }
@@ -96,7 +98,13 @@ pub fn frame_diff(prev: &Frame, cur: &Frame) -> f64 {
     debug_assert_eq!(prev.pixels.len(), cur.pixels.len());
     let mut sum = 0u64;
     let mut n = 0u64;
-    for (a, b) in prev.pixels.chunks_exact(4).zip(cur.pixels.chunks_exact(4)) {
+    for (a, b) in prev
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(cur.pixels.as_chunks::<4>().0.iter())
+    {
         sum += (a[0] as i32 - b[0] as i32).unsigned_abs() as u64;
         sum += (a[1] as i32 - b[1] as i32).unsigned_abs() as u64;
         sum += (a[2] as i32 - b[2] as i32).unsigned_abs() as u64;
@@ -359,7 +367,7 @@ mod tests {
 
     fn frame_of(v: u8, w: u32, h: u32) -> Frame {
         let mut pixels = vec![0u8; (w * h * 4) as usize];
-        for p in pixels.chunks_exact_mut(4) {
+        for p in pixels.as_chunks_mut::<4>().0.iter_mut() {
             p.copy_from_slice(&[v, v, v, 255]);
         }
         Frame {

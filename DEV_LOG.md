@@ -467,3 +467,8 @@ local checks are not a claim of a live provider or cross-platform pass.
 
 Added a proprietary/all-rights-reserved notice granting no usage rights. Third-party
 terms and repository visibility remain unchanged.
+
+The first branch CI run found Rust 1.98's new constant-chunk Clippy lint (local
+initial checks used 1.94). PCM, metric and pixel-test iteration now uses typed
+array chunks; the lint is fixed rather than suppressed. The CI-matching 1.98
+toolchain is also used for local follow-up validation.
