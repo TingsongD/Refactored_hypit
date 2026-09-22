@@ -28,7 +28,7 @@ paid request, or model download is part of this delivery.
 | C3 silent-source music | Independent music track with content-addressed import | CLI real-media regression checks audio stream |
 | C4 invalid beat widths | Early finite/positive representable-width check; consistent source windows | CLI rejects zero/NaN/infinity; span tests |
 | I1 PCM deadlines | Guard active reads; managed process groups retain descendants through teardown | PCM idle/blocked-read and descendant-stderr deadline tests |
-| D1 examples/docs | Add voice tracks; correct optional script semantics, crate count, cache/provider/media-test docs | Complete README, SKILL, guide and caption example checks |
+| D1 examples/docs | Add voice tracks; correct optional script semantics, crate count, cache/provider/media-test docs | Complete README, SKILL, guide, adapt and caption example checks |
 | Deferred scheduler | Shared ascending jobs, ordered results, maximum 4×workers outstanding, persistent renderers and incremental state replay | Worker-count/window byte equality, sustained four-worker activity, bound, cancellation and panic tests |
 | Deferred scaled windows | Seek with normalized timestamps, frame-grid half-open bounds and decode postroll | Sequential pixel equality including nonzero timestamp origin and fractional boundaries |
 | Deferred chunked HTTP | Bounded headers, decoded body, trailers; strict framing and explicit 400/408/413 errors | Fragmented reads, extensions/trailers, conflicts, malformed/truncated/oversize and timeout tests |
@@ -36,6 +36,8 @@ paid request, or model download is part of this delivery.
 
 ## Additional review corrections
 
+- Root and target confinement use the same canonical ancestor representation on
+  Windows, including nonexistent project directories and native absolute paths.
 - JSON float round trips preserve cache identity across fresh and cached runs.
 - HTTP query selectors affect cache keys; conventional credential parameters and
   registry auth values do not. Put credentials in registry authentication fields.
@@ -53,7 +55,7 @@ paid request, or model download is part of this delivery.
 ## Verification scope
 
 Local acceptance: formatting and strict all-target Clippy pass; hermetic workspace
-tests pass; `SCENE_MEDIA_TESTS=1` workspace tests report 332 passed, 0 failed,
+tests pass; `SCENE_MEDIA_TESTS=1` workspace tests report 333 passed, 0 failed,
 4 ignored subprocess fixtures. Four Python offline adapter tests pass. Release
 build, an 18-frame video/audio CLI smoke render, and release large-offset test pass. Main publication additionally requires the working
 branch's Linux/macOS/Windows workflow to pass; the delivery report links the exact

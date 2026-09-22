@@ -28,6 +28,10 @@ mod tests {
 
     use super::*;
 
+    fn project_root() -> PathBuf {
+        std::env::current_dir().unwrap().canonicalize().unwrap()
+    }
+
     fn timing(start: u32, end: u32) -> ResolvedTiming {
         // `start`/`end` are program *seconds* — tests stay readable.
         ResolvedTiming {
@@ -112,12 +116,12 @@ mod tests {
             ],
             10,
         );
-        let (graph, diags) = AudioGraph::from_scene(&scene, Path::new("/proj"));
+        let (graph, diags) = AudioGraph::from_scene(&scene, &project_root());
         assert!(diags.is_empty());
         assert_eq!(graph.clips.len(), 2);
         assert_eq!(graph.program_samples, 10 * PROGRAM_RATE);
         let music = &graph.clips[0];
-        assert_eq!(music.src, PathBuf::from("/proj/bed.mp3"));
+        assert_eq!(music.src, project_root().join("bed.mp3"));
         assert_eq!(music.gain_db, -14.0);
         assert_eq!(music.target.start, 0);
         // duck="voice" → keyed by the clip living on the voice track
@@ -162,7 +166,7 @@ mod tests {
             ],
             10,
         );
-        let (graph, diags) = AudioGraph::from_scene(&scene, Path::new("/proj"));
+        let (graph, diags) = AudioGraph::from_scene(&scene, &project_root());
         assert!(diags.is_empty());
         assert_eq!(graph.clips[0].src_start_s, 2.5);
         assert_eq!(graph.clips[1].src_start_s, 0.25);
@@ -185,7 +189,7 @@ mod tests {
             )],
             5,
         );
-        let (graph, diags) = AudioGraph::from_scene(&scene, Path::new("/p"));
+        let (graph, diags) = AudioGraph::from_scene(&scene, &project_root());
         assert!(graph.duck.is_empty());
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("narration"));
@@ -203,7 +207,7 @@ mod tests {
             timing(1, 2),
         )];
         let scene = scene(vec![track("v", vec![board])], 4);
-        let (graph, _) = AudioGraph::from_scene(&scene, Path::new("/p"));
+        let (graph, _) = AudioGraph::from_scene(&scene, &project_root());
         assert_eq!(graph.clips.len(), 1);
         assert_eq!(graph.clips[0].target.start, PROGRAM_RATE);
     }
@@ -236,7 +240,7 @@ mod tests {
             )],
             4,
         );
-        let (graph, diags) = AudioGraph::from_scene(&rel, Path::new("/proj"));
+        let (graph, diags) = AudioGraph::from_scene(&rel, &project_root());
         assert_eq!(graph.clips.len(), 1);
         assert!(graph.clips[0].src.ends_with("inside.wav"));
         assert_eq!(diags.len(), 1);
@@ -257,7 +261,7 @@ mod tests {
             )],
             4,
         );
-        let (graph, diags) = AudioGraph::from_scene(&abs, Path::new("/proj"));
+        let (graph, diags) = AudioGraph::from_scene(&abs, &project_root());
         assert!(graph.clips.is_empty());
         assert_eq!(diags.len(), 1);
     }

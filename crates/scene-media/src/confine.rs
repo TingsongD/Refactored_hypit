@@ -61,19 +61,26 @@ fn normalize_lexical(p: PathBuf) -> PathBuf {
 pub fn confine_under_root(root: &Path, rel: &Path) -> Result<PathBuf, Escapes> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root_abs = normalize_lexical(cwd.join(root));
-    let root_real = std::fs::canonicalize(&root_abs).unwrap_or(root_abs);
+    let root_real = canonicalize_existing(&root_abs);
     let resolved = normalize_lexical(root_real.join(rel));
-    let escapes = |resolved: PathBuf| Escapes {
-        rel: rel.to_path_buf(),
-        resolved,
-        root: root_real.clone(),
-    };
+    let resolved = canonicalize_existing(&resolved);
     if !resolved.starts_with(&root_real) {
-        return Err(escapes(resolved));
+        return Err(Escapes {
+            rel: rel.to_path_buf(),
+            resolved,
+            root: root_real,
+        });
     }
+    Ok(resolved)
+}
+
+/// Canonicalize both roots and targets through their deepest existing ancestor.
+/// This keeps Windows verbatim prefixes and symlink aliases consistent even
+/// when the final directory/file does not exist yet.
+fn canonicalize_existing(path: &Path) -> PathBuf {
     // The path may not exist yet — canonicalize the deepest ancestor
     // that does, reattach the tail, re-check.
-    let mut probe = resolved.clone();
+    let mut probe = path.to_path_buf();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let real = loop {
         if let Ok(canon) = std::fs::canonicalize(&probe) {
@@ -91,10 +98,7 @@ pub fn confine_under_root(root: &Path, rel: &Path) -> Result<PathBuf, Escapes> {
     for part in tail.iter().rev() {
         resolved.push(part);
     }
-    if !resolved.starts_with(&root_real) {
-        return Err(escapes(resolved));
-    }
-    Ok(resolved)
+    resolved
 }
 
 #[cfg(test)]
@@ -115,6 +119,23 @@ mod tests {
         // An absolute path inside the root is fine.
         let inside = cwd.join("sub").join("x.png");
         assert_eq!(confine_under_root(root, &inside).unwrap(), inside);
+    }
+
+    #[test]
+    fn nonexistent_roots_and_native_absolute_paths_share_canonical_identity() {
+        let base = std::env::temp_dir();
+        let root = base.join(format!("future-scene-root-{}", std::process::id()));
+        let expected_root = base.canonicalize().unwrap().join(root.file_name().unwrap());
+        let expected = expected_root.join("audio.wav");
+        assert_eq!(
+            confine_under_root(&root, Path::new("audio.wav")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            confine_under_root(&root, &root.join("audio.wav")).unwrap(),
+            expected
+        );
+        assert!(confine_under_root(&root, Path::new("../outside.wav")).is_err());
     }
 
     #[cfg(unix)]

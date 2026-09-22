@@ -481,3 +481,14 @@ frame now fail after probing, before perception or any provider call.
 The second CI run passed Linux/macOS and exposed remaining slash-literal
 assertions in the Windows adapt-path test. The entire test now compares native
 Path values, including the absolute-source case, instead of platform strings.
+
+Windows then reached the audio tests and exposed canonical-prefix mismatch for
+nonexistent project roots. Confinement now canonicalizes the deepest existing
+ancestor consistently for both roots and targets, including native absolute
+paths. A missing-root regression retains escape rejection; audio graph fixtures
+use a real native project root. No confinement check is disabled.
+
+After that correction, the Rust 1.98 FFmpeg-enabled workspace suite reports
+333 passed, 0 failed, four subprocess fixtures ignored by direct invocation.
+CI now collects all crate failures and runs the media suite after a test failure
+as well, so later platform defects are visible in the same run.

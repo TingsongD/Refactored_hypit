@@ -55,13 +55,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       # Fail loudly rather than silently skipping the media suite.
       - name: Check FFmpeg
+        if: ${{ !cancelled() }}
         run: ffmpeg -version && ffprobe -version
 
       - name: Test (real media)
-        run: cargo test --workspace
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --no-fail-fast
         env:
           SCENE_MEDIA_TESTS: "1"
